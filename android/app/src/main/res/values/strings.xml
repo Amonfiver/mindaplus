@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">Mindaplus</string>
+    <string name="telegram_token_hint">Telegram Bot Token</string>
+    <string name="chat_id_hint">Telegram Chat ID</string>
+    <string name="start_monitoring">Start Monitoring</string>
+    <string name="stop_monitoring">Stop Monitoring</string>
+    <string name="transfer_100">Transfer 100</string>
+    <string name="transfer_200">Transfer 200</string>
+    <string name="transfer_300">Transfer 300</string>
+    <string name="status_ok">OK</string>
+    <string name="status_obstaculo">OBSTÁCULO</string>
+    <string name="camera_permission_required">Camera permission is required to monitor transfers</string>
+    <string name="transfer_stopped_message">Transfer %1$d parado, obstáculo en la vía.</string>
+    <string name="transfer_rearmed_message">Transfer %1$d rearmado, todo OK.</string>
+</resources>

@@ -1,0 +1,28 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Gradle
+.gradle/
+**/build/
+
+# Android local config
+local.properties
+
+# Kotlin/Java
+*.class
+
+# Logs
+*.log
+
+# Keystore (por seguridad)
+*.jks
+*.keystore
+
+# Node / misc (por si hay herramientas)
+node_modules/
