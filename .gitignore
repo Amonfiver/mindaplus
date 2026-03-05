@@ -26,3 +26,14 @@ local.properties
 
 # Node / misc (por si hay herramientas)
 node_modules/
+
+# Heap dumps / profiling
+*.hprof
+android/*.hprof
+
+# Android Studio / Gradle
+**/.gradle/
+**/build/
+**/.idea/
+*.iml
+local.properties
