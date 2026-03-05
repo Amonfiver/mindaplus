@@ -21,6 +21,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.mindaplus.android.ui.theme.MindaplusTheme
 import kotlinx.coroutines.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 
 class MainActivity : ComponentActivity() {
     private lateinit var cameraManager: CameraManager
@@ -36,6 +38,8 @@ class MainActivity : ComponentActivity() {
         300 to TransferState.OK
     ))
     private var previewView by mutableStateOf<PreviewView?>(null)
+    private var isTrained by mutableStateOf(false)
+    private var trainingProgress by mutableStateOf(0 to 9)
     
     // 5-second throttle mechanism
     private var lastAnalysisTime = 0L
@@ -61,7 +65,7 @@ class MainActivity : ComponentActivity() {
         // Initialize managers
         telegramNotifier = TelegramNotifier()
         cameraManager = CameraManager(this)
-        transferMonitor = TransferMonitor()
+        transferMonitor = TransferMonitor(this)
         
         setContent {
             MindaplusTheme {
@@ -75,6 +79,9 @@ class MainActivity : ComponentActivity() {
         }
         
         checkCameraPermission()
+        
+        // Update training status
+        updateTrainingStatus()
     }
 
     private fun checkCameraPermission() {
@@ -187,9 +194,16 @@ class MainActivity : ComponentActivity() {
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxHeight(),
+                    .fillMaxHeight()
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
+                Text(
+                    text = "V0.2 TRAINING UI",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.Magenta
+                )
                 // Telegram Configuration
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -266,6 +280,77 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 
+                // Training Status and Controls
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Training Status",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Entrenado:",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                            
+                            Text(
+                                text = if (isTrained) "Sí" else "No",
+                                color = if (isTrained) Color.Green else Color.Red,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Progreso:",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                            
+                            Text(
+                                text = "${trainingProgress.first}/${trainingProgress.second}",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = { openTrainingScreen() },
+                                modifier = Modifier.weight(1f),
+                                enabled = !isMonitoring
+                            ) {
+                                Text("Entrenamiento")
+                            }
+                            
+                            Button(
+                                onClick = { recalibrateLanes() },
+                                modifier = Modifier.weight(1f),
+                                enabled = !isMonitoring
+                            ) {
+                                Text("Recalibrar vías")
+                            }
+                        }
+                    }
+                }
+                
                 Spacer(modifier = Modifier.weight(1f))
                 
                 // Monitoring Status
@@ -305,6 +390,8 @@ class MainActivity : ComponentActivity() {
                 color = when (state) {
                     TransferState.OK -> Color.Green
                     TransferState.OBSTACULO -> Color.Red
+                    TransferState.FALLO -> Color(0xFFFFA500) // Orange
+                    TransferState.UNKNOWN -> Color.Gray
                 },
                 fontWeight = FontWeight.Bold
             )
@@ -324,6 +411,24 @@ class MainActivity : ComponentActivity() {
         isMonitoring = false
         Log.d("Mindaplus", "MainActivity: Monitoring stopped")
     }
+    
+    private fun openTrainingScreen() {
+        Log.d("Mindaplus", "MainActivity: Opening training screen")
+        val intent = android.content.Intent(this, TrainingActivity::class.java)
+        startActivity(intent)
+    }
+    
+    private fun recalibrateLanes() {
+        Log.d("Mindaplus", "MainActivity: Recalibrating lanes")
+        transferMonitor.recalibrateLanes()
+        Log.d("Mindaplus", "MainActivity: Lane calibration reset")
+    }
+    
+    private fun updateTrainingStatus() {
+        isTrained = transferMonitor.isTrained()
+        trainingProgress = transferMonitor.getTrainingProgress()
+        Log.d("Mindaplus", "MainActivity: Training status updated - trained: $isTrained, progress: ${trainingProgress.first}/${trainingProgress.second}")
+    }
 
     private fun sendNotification(transferId: Int, oldState: TransferState, newState: TransferState) {
         val message = when {
@@ -331,6 +436,8 @@ class MainActivity : ComponentActivity() {
                 "Transfer $transferId parado, obstáculo en la vía."
             oldState == TransferState.OBSTACULO && newState == TransferState.OK -> 
                 "Transfer $transferId rearmado, todo OK."
+            newState == TransferState.FALLO -> 
+                "Transfer $transferId en fallo."
             else -> return
         }
         
@@ -358,11 +465,15 @@ class MainActivity : ComponentActivity() {
 
 enum class TransferState {
     OK,
-    OBSTACULO;
+    OBSTACULO,
+    FALLO,
+    UNKNOWN;
     
     val displayName: String
         get() = when (this) {
             OK -> "OK"
             OBSTACULO -> "OBSTÁCULO"
+            FALLO -> "FALLO"
+            UNKNOWN -> "DESCONOCIDO"
         }
 }
