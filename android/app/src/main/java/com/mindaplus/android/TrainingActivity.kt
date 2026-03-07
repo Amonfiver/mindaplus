@@ -103,6 +103,7 @@ class TrainingActivity : ComponentActivity() {
     }
     
     @Composable
+    @OptIn(ExperimentalMaterial3Api::class)
     private fun TrainingScreen() {
         Row(
             modifier = Modifier
@@ -240,18 +241,38 @@ class TrainingActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            text = "State Selection",
+                            text = "Estado Manual de la Plantilla",
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold
                         )
-                        
+                        Text(
+                            text = "Selecciona explícitamente el estado que se guardará para esta captura:",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.Gray
+                        )
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            StateButton("OK", selectedState == TransferState.OK) { selectedState = TransferState.OK }
-                            StateButton("OBSTÁCULO", selectedState == TransferState.OBSTACULO) { selectedState = TransferState.OBSTACULO }
-                            StateButton("FALLO", selectedState == TransferState.FALLO) { selectedState = TransferState.FALLO }
+                            FilterChip(
+                                selected = selectedState == TransferState.OK,
+                                onClick = { selectedState = TransferState.OK },
+                                label = { Text("OK") },
+                                modifier = Modifier.weight(1f)
+                            )
+                            FilterChip(
+                                selected = selectedState == TransferState.OBSTACULO,
+                                onClick = { selectedState = TransferState.OBSTACULO },
+                                label = { Text("OBSTÁCULO") },
+                                modifier = Modifier.weight(1f)
+                            )
+                            FilterChip(
+                                selected = selectedState == TransferState.FALLO,
+                                onClick = { selectedState = TransferState.FALLO },
+                                label = { Text("FALLO") },
+                                modifier = Modifier.weight(1f)
+                            )
                         }
                     }
                 }
@@ -344,7 +365,7 @@ class TrainingActivity : ComponentActivity() {
                     }
                     
                     Button(
-                        onClick = { saveAndFinish() },
+                        onClick = { saveTemplate() },
                         modifier = Modifier.weight(1f),
                         enabled = capturedTemplatePreview != null && 
                                  lastCapturedTransfer == selectedTransfer && 
@@ -359,6 +380,25 @@ class TrainingActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Cancelar")
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { recalibrateTrainingSession() },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Recalibrar vías")
+                    }
+
+                    OutlinedButton(
+                        onClick = { finish() },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Salir")
+                    }
                 }
                 
                 Spacer(modifier = Modifier.weight(1f))
@@ -505,16 +545,12 @@ class TrainingActivity : ComponentActivity() {
     
     private fun cancelCapture() {
         Log.d(TAG, "Canceling current capture and clearing preview")
-        capturedTemplatePreview = null
-        detectedLaneRegion = null
-        lastCapturedTransfer = null
-        lastCapturedState = null
-        pendingTemplateBitmap = null // Limpiar template pendiente
+        clearPendingCaptureData()
         showMessage("Captura cancelada")
     }
     
-    private fun saveAndFinish() {
-        Log.d(TAG, "Saving training data and finishing")
+    private fun saveTemplate() {
+        Log.d(TAG, "Saving training template and staying in TrainingActivity")
         
         lifecycleScope.launch {
             try {
@@ -547,12 +583,7 @@ class TrainingActivity : ComponentActivity() {
                         showMessage("Template guardado: ${progress.first}/${progress.second} templates")
                     }
                     
-                    // Limpiar el template pendiente
-                    pendingTemplateBitmap = null
-                    
-                    // Cerrar activity con resultado OK
-                    setResult(RESULT_OK)
-                    finish()
+                    clearPendingCaptureData()
                 } else {
                     Log.e(TAG, "Failed to save template to storage")
                     showMessage("Error al guardar el template")
@@ -563,6 +594,22 @@ class TrainingActivity : ComponentActivity() {
                 showMessage("Error al guardar: ${e.message}")
             }
         }
+    }
+
+    private fun recalibrateTrainingSession() {
+        Log.d(TAG, "Recalibrating training session: clearing lane cache and capture state")
+        laneDetector.clearCache()
+        transferMonitor.recalibrateLanes()
+        clearPendingCaptureData()
+        showMessage("Vías recalibradas. Sesión lista para nueva captura.")
+    }
+
+    private fun clearPendingCaptureData() {
+        capturedTemplatePreview = null
+        detectedLaneRegion = null
+        lastCapturedTransfer = null
+        lastCapturedState = null
+        pendingTemplateBitmap = null
     }
     
     private fun imageToBitmap(image: Image): Bitmap? {

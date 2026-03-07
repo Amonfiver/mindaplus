@@ -22,6 +22,7 @@ class LaneDetector {
         private const val DEFAULT_X_END_RATIO = 0.78f
         private const val DEFAULT_Y_START_RATIO = 0.22f
         private const val DEFAULT_Y_END_RATIO = 0.78f
+        private const val HORIZONTAL_EXPANSION_RATIO = 0.12f
     }
     
     data class LaneRegion(val left: Int, val top: Int, val right: Int, val bottom: Int)
@@ -145,8 +146,9 @@ class LaneDetector {
         val sortedCenters = centers.sorted()
         val laneHeight = (imageHeight * 0.14f).toInt().coerceIn(36, imageHeight / 3)
         val halfLane = laneHeight / 2
-        val left = (imageWidth * DEFAULT_X_START_RATIO).toInt().coerceIn(0, imageWidth - 1)
-        val right = (imageWidth * DEFAULT_X_END_RATIO).toInt().coerceIn(left + 1, imageWidth)
+        val baseLeft = (imageWidth * DEFAULT_X_START_RATIO).toInt().coerceIn(0, imageWidth - 1)
+        val baseRight = (imageWidth * DEFAULT_X_END_RATIO).toInt().coerceIn(baseLeft + 1, imageWidth)
+        val (left, right) = expandHorizontalBounds(imageWidth, baseLeft, baseRight)
 
         val lanes = sortedCenters.map { centerY ->
             val top = (centerY - halfLane).coerceIn(0, imageHeight - 2)
@@ -257,8 +259,9 @@ class LaneDetector {
     }
 
     private fun buildFallbackLanes(imageWidth: Int, imageHeight: Int): List<LaneRegion> {
-        val left = (imageWidth * DEFAULT_X_START_RATIO).toInt().coerceIn(0, imageWidth - 1)
-        val right = (imageWidth * DEFAULT_X_END_RATIO).toInt().coerceIn(left + 1, imageWidth)
+        val baseLeft = (imageWidth * DEFAULT_X_START_RATIO).toInt().coerceIn(0, imageWidth - 1)
+        val baseRight = (imageWidth * DEFAULT_X_END_RATIO).toInt().coerceIn(baseLeft + 1, imageWidth)
+        val (left, right) = expandHorizontalBounds(imageWidth, baseLeft, baseRight)
         val yStart = (imageHeight * DEFAULT_Y_START_RATIO).toInt().coerceIn(0, imageHeight - 1)
         val yEnd = (imageHeight * DEFAULT_Y_END_RATIO).toInt().coerceIn(yStart + 1, imageHeight)
         val laneSpan = max(1, (yEnd - yStart) / 3)
@@ -273,6 +276,17 @@ class LaneDetector {
 
         Log.w(TAG, "Fallback lane regions generated: ${lanes.joinToString()}")
         return lanes
+    }
+
+    private fun expandHorizontalBounds(imageWidth: Int, baseLeft: Int, baseRight: Int): Pair<Int, Int> {
+        val margin = (imageWidth * HORIZONTAL_EXPANSION_RATIO).toInt().coerceAtLeast(24)
+        val expandedLeft = (baseLeft - margin).coerceIn(0, imageWidth - 1)
+        val expandedRight = (baseRight + margin).coerceIn(expandedLeft + 1, imageWidth)
+        Log.d(
+            TAG,
+            "Expanding lane ROI horizontally: base=[$baseLeft,$baseRight] margin=$margin expanded=[$expandedLeft,$expandedRight]"
+        )
+        return expandedLeft to expandedRight
     }
     
     /**
