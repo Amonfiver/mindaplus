@@ -1,12 +1,13 @@
-# Mindaplus Android App v0.1
+# Mindaplus Android App v0.2
 
-Android application for monitoring 3 transfers (T100/T200/T300) using camera detection to identify orange color (obstacles) and send Telegram notifications.
+Android application for monitoring 3 transfers (T100/T200/T300) using camera-based template matching and automatic lane detection with Telegram notifications.
 
-## Features (v0.1)
+## Features (v0.2)
 
+- **Template-based monitoring**: Advanced template matching for state detection (NEW)
+- **Automatic lane detection**: Computer vision identifies transfer regions automatically (NEW)
+- **Training workflow**: Complete training system with visual feedback (NEW)
 - **Camera-based monitoring**: Uses CameraX for real-time video analysis
-- **Fixed ROI detection**: 3 predefined regions of interest for each transfer
-- **Orange color detection**: HSV-based color analysis to identify obstacles
 - **Telegram notifications**: Sends messages on state transitions only (anti-spam)
 - **Landscape orientation**: Optimized for tripod mounting
 - **5-second analysis interval**: Fixed analysis frequency as specified
@@ -44,6 +45,29 @@ Android application for monitoring 3 transfers (T100/T200/T300) using camera det
 3. Grant camera permission when prompted
 4. Enter your Telegram Bot Token and Chat ID
 5. Click "Start Monitoring"
+
+## Training Workflow (NEW in v0.2)
+
+Mindaplus v0.2 includes a complete training system that allows you to teach the app to recognize different states (OK, OBSTÁCULO, FALLO) for each transfer. See [TRAINING_WORKFLOW.md](../TRAINING_WORKFLOW.md) for detailed instructions.
+
+### Quick Training Steps
+
+1. **Open Training**: Tap "Entrenamiento" from the main screen
+2. **Select Transfer**: Choose T100, T200, or T300 (upper/middle/lower lanes)
+3. **Select State**: Choose the current state (OK, OBSTÁCULO, FALLO)
+4. **Position Transfer**: Ensure the transfer shows the selected state
+5. **Capture**: Press "Capturar plantilla" - system auto-detects lane region
+6. **Verify**: Check the template preview shows correct region
+7. **Save**: Press "Guardar" to confirm the capture
+8. **Repeat**: Complete all 9 templates (3 transfers × 3 states)
+
+### Training Features
+
+- **Automatic lane detection**: System identifies transfer regions automatically
+- **Visual feedback**: Template preview with cropped image and region coordinates
+- **Progress tracking**: Shows 0/9 → 9/9 completion status
+- **Error handling**: Clear messages for common issues
+- **Smart validation**: Save button only enabled after valid capture
 
 ## Usage
 

@@ -1,12 +1,16 @@
 package com.mindaplus.android
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
 import android.media.Image
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -15,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -26,6 +31,7 @@ class TrainingActivity : ComponentActivity() {
     private lateinit var cameraManager: CameraManager
     private lateinit var transferMonitor: TransferMonitor
     private lateinit var templateStorage: TemplateStorage
+    private lateinit var laneDetector: LaneDetector
     
     private var previewView by mutableStateOf<PreviewView?>(null)
     private var selectedTransfer by mutableStateOf(100)
@@ -33,6 +39,10 @@ class TrainingActivity : ComponentActivity() {
     private var trainingProgress by mutableStateOf(0 to 9)
     private var isCapturing by mutableStateOf(false)
     private var lastCapturedImage by mutableStateOf<Image?>(null)
+    private var capturedTemplatePreview by mutableStateOf<Bitmap?>(null)
+    private var detectedLaneRegion by mutableStateOf<LaneDetector.LaneRegion?>(null)
+    private var lastCapturedTransfer by mutableStateOf<Int?>(null)
+    private var lastCapturedState by mutableStateOf<TransferState?>(null)
     
     companion object {
         private const val TAG = "TrainingActivity"
@@ -48,6 +58,7 @@ class TrainingActivity : ComponentActivity() {
         cameraManager = CameraManager(this)
         transferMonitor = TransferMonitor(this)
         templateStorage = TemplateStorage(this)
+        laneDetector = LaneDetector()
         
         setContent {
             MindaplusTheme {
@@ -280,6 +291,47 @@ class TrainingActivity : ComponentActivity() {
                     }
                 }
                 
+                // Template Preview (shown after capture)
+                if (capturedTemplatePreview != null && detectedLaneRegion != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Template Captured",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.Green
+                            )
+                            
+                            Text(
+                                text = "Transfer: T${lastCapturedTransfer ?: selectedTransfer}, State: ${lastCapturedState?.displayName ?: selectedState.displayName}",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            
+                            Text(
+                                text = "Detected region: ${detectedLaneRegion?.left ?: 0},${detectedLaneRegion?.top ?: 0} to ${detectedLaneRegion?.right ?: 0},${detectedLaneRegion?.bottom ?: 0}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray
+                            )
+                            
+                            capturedTemplatePreview?.let { bitmap ->
+                                Image(
+                                    bitmap = bitmap.asImageBitmap(),
+                                    contentDescription = "Template Preview",
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(120.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                
                 // Action Buttons
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -296,14 +348,16 @@ class TrainingActivity : ComponentActivity() {
                     Button(
                         onClick = { saveAndFinish() },
                         modifier = Modifier.weight(1f),
-                        enabled = trainingProgress.first > 0
+                        enabled = capturedTemplatePreview != null && 
+                                 lastCapturedTransfer == selectedTransfer && 
+                                 lastCapturedState == selectedState
                     ) {
                         Text("Guardar")
                     }
                 }
                 
                 Button(
-                    onClick = { finish() },
+                    onClick = { cancelCapture() },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Cancelar")
@@ -348,37 +402,91 @@ class TrainingActivity : ComponentActivity() {
         if (isCapturing) return
         
         isCapturing = true
+        Log.d(TAG, "Template capture started for T$selectedTransfer ${selectedState.displayName}")
         
         lifecycleScope.launch {
             try {
                 val image = lastCapturedImage
                 if (image == null) {
                     Log.w(TAG, "No image available for template capture")
+                    showMessage("No hay imagen disponible para captura")
                     isCapturing = false
                     return@launch
                 }
                 
-                Log.d(TAG, "Capturing template for T$selectedTransfer ${selectedState.displayName}")
+                Log.d(TAG, "Processing image for template capture: ${image.width}x${image.height}")
                 
-                // Convert image to bitmap
-                val bitmap = imageToBitmap(image)
-                if (bitmap == null) {
+                // Step 1: Detect lanes to find the correct region for this transfer
+                val laneDetection = laneDetector.detectLanes(image, image.width, image.height)
+                if (laneDetection.requiresCalibration || laneDetection.lanes == null) {
+                    Log.e(TAG, "Lane detection failed - cannot capture template")
+                    showMessage("Error: No se pudieron detectar las vías")
+                    isCapturing = false
+                    return@launch
+                }
+                
+                val lanes = laneDetection.lanes
+                Log.d(TAG, "Successfully detected ${lanes.size} lanes")
+                
+                // Step 2: Select the appropriate lane based on transfer selection
+                val targetLaneIndex = when (selectedTransfer) {
+                    100 -> 0 // Upper lane (T100)
+                    200 -> 1 // Middle lane (T200)
+                    300 -> 2 // Lower lane (T300)
+                    else -> {
+                        Log.e(TAG, "Invalid transfer selection: $selectedTransfer")
+                        showMessage("Error: Transfer inválido")
+                        isCapturing = false
+                        return@launch
+                    }
+                }
+                
+                if (targetLaneIndex >= lanes.size) {
+                    Log.e(TAG, "Target lane index $targetLaneIndex out of bounds for ${lanes.size} lanes")
+                    showMessage("Error: Vía no detectada")
+                    isCapturing = false
+                    return@launch
+                }
+                
+                val targetLane = lanes[targetLaneIndex]
+                Log.d(TAG, "Selected lane $targetLaneIndex for T$selectedTransfer: $targetLane")
+                
+                // Step 3: Convert image to bitmap and crop to detected region
+                val fullBitmap = imageToBitmap(image)
+                if (fullBitmap == null) {
                     Log.e(TAG, "Failed to convert image to bitmap")
+                    showMessage("Error al procesar imagen")
                     isCapturing = false
                     return@launch
                 }
                 
-                // Save template
-                val success = templateStorage.saveTemplate(selectedTransfer, selectedState, bitmap)
+                // Step 4: Crop to the detected lane region
+                val croppedBitmap = cropToRegion(fullBitmap, targetLane)
+                if (croppedBitmap == null) {
+                    Log.e(TAG, "Failed to crop image to lane region")
+                    showMessage("Error al recortar la región")
+                    isCapturing = false
+                    return@launch
+                }
+                
+                Log.d(TAG, "Successfully cropped image to ${croppedBitmap.width}x${croppedBitmap.height}")
+                
+                // Step 5: Save the cropped template
+                val success = templateStorage.saveTemplate(selectedTransfer, selectedState, croppedBitmap)
                 if (success) {
-                    Log.d(TAG, "Template captured successfully for T$selectedTransfer ${selectedState.displayName}")
-                    updateTrainingProgress()
+                    Log.d(TAG, "Template saved successfully for T$selectedTransfer ${selectedState.displayName}")
                     
-                    // Show success message
-                    showMessage("Template capturado exitosamente")
+                    // Update UI with preview and region info
+                    capturedTemplatePreview = croppedBitmap
+                    detectedLaneRegion = targetLane
+                    lastCapturedTransfer = selectedTransfer
+                    lastCapturedState = selectedState
+                    
+                    updateTrainingProgress()
+                    showMessage("Template capturado exitosamente - Región detectada: ${targetLane.left},${targetLane.top} a ${targetLane.right},${targetLane.bottom}")
                 } else {
-                    Log.e(TAG, "Failed to save template")
-                    showMessage("Error al capturar template")
+                    Log.e(TAG, "Failed to save template to storage")
+                    showMessage("Error al guardar el template")
                 }
                 
             } catch (e: Exception) {
@@ -388,6 +496,39 @@ class TrainingActivity : ComponentActivity() {
                 isCapturing = false
             }
         }
+    }
+    
+    private fun cropToRegion(bitmap: Bitmap, region: LaneDetector.LaneRegion): Bitmap? {
+        return try {
+            // Ensure region is within bitmap bounds
+            val left = region.left.coerceIn(0, bitmap.width - 1)
+            val top = region.top.coerceIn(0, bitmap.height - 1)
+            val right = region.right.coerceIn(left + 1, bitmap.width)
+            val bottom = region.bottom.coerceIn(top + 1, bitmap.height)
+            
+            val width = right - left
+            val height = bottom - top
+            
+            if (width <= 0 || height <= 0) {
+                Log.e(TAG, "Invalid crop dimensions: ${width}x${height}")
+                return null
+            }
+            
+            Bitmap.createBitmap(bitmap, left, top, width, height)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error cropping bitmap to region", e)
+            null
+        }
+    }
+    
+    private fun cancelCapture() {
+        Log.d(TAG, "Canceling current capture and clearing preview")
+        capturedTemplatePreview = null
+        detectedLaneRegion = null
+        lastCapturedTransfer = null
+        lastCapturedState = null
+        showMessage("Captura cancelada")
     }
     
     private fun saveAndFinish() {
