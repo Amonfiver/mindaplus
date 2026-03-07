@@ -1,5 +1,6 @@
 package com.mindaplus.android
 
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.media.Image
 import android.util.Log
@@ -21,6 +22,81 @@ class LaneDetector {
     
     private var cachedLanes: List<LaneRegion>? = null
     
+    /**
+     * Detecta carriles desde un Bitmap
+     */
+    fun detectLanes(bitmap: Bitmap): DetectionResult {
+        return try {
+            val imageWidth = bitmap.width
+            val imageHeight = bitmap.height
+            
+            // Use cached lanes if available (calibrate once and freeze)
+            if (cachedLanes != null) {
+                return DetectionResult(cachedLanes, false)
+            }
+            
+            // Convertir Bitmap a formato YUV para análisis
+            val yBuffer = extractYChannelFromBitmap(bitmap)
+            
+            // Downsample for performance
+            val downsampledWidth = imageWidth / DOWNSAMPLE_FACTOR
+            val downsampledHeight = imageHeight / DOWNSAMPLE_FACTOR
+            
+            // Analyze contrast profile across multiple rows
+            val contrastProfiles = mutableListOf<IntArray>()
+            val rowStep = max(1, imageHeight / LANE_DETECTION_ROWS)
+            
+            for (y in 0 until imageHeight step rowStep) {
+                val profile = analyzeRowContrastFromYBuffer(y, yBuffer, imageWidth, downsampledWidth)
+                contrastProfiles.add(profile)
+            }
+            
+            // Find lane boundaries by detecting high contrast regions
+            val laneBoundaries = findLaneBoundaries(contrastProfiles, downsampledWidth)
+            
+            if (laneBoundaries.size < 6) { // Need at least 3 lanes (6 boundaries)
+                Log.w(TAG, "Insufficient lane boundaries detected: ${laneBoundaries.size}")
+                return DetectionResult(null, true)
+            }
+            
+            // Convert boundaries to lane regions
+            val lanes = mutableListOf<LaneRegion>()
+            for (i in 0 until laneBoundaries.size - 1 step 2) {
+                if (i + 1 < laneBoundaries.size) {
+                    val left = laneBoundaries[i] * DOWNSAMPLE_FACTOR
+                    val right = laneBoundaries[i + 1] * DOWNSAMPLE_FACTOR
+                    
+                    if (right - left >= MIN_LANE_WIDTH_PX) {
+                        val top = imageHeight * 0.2f
+                        val bottom = imageHeight * 0.4f
+                        
+                        lanes.add(LaneRegion(left, top.toInt(), right, bottom.toInt()))
+                        
+                        if (lanes.size == 3) break // We only need 3 lanes
+                    }
+                }
+            }
+            
+            if (lanes.size != 3) {
+                Log.w(TAG, "Failed to detect exactly 3 lanes: ${lanes.size}")
+                return DetectionResult(null, true)
+            }
+            
+            // Cache the detected lanes
+            cachedLanes = lanes
+            Log.d(TAG, "Successfully detected ${lanes.size} lanes from Bitmap")
+            
+            return DetectionResult(lanes, false)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting lanes from Bitmap", e)
+            return DetectionResult(null, true)
+        }
+    }
+    
+    /**
+     * Detecta carriles desde una Image (método original)
+     */
     fun detectLanes(image: Image, imageWidth: Int, imageHeight: Int): DetectionResult {
         try {
             // Use cached lanes if available (calibrate once and freeze)
@@ -91,6 +167,61 @@ class LaneDetector {
             Log.e(TAG, "Error detecting lanes", e)
             return DetectionResult(null, true)
         }
+    }
+    
+    /**
+     * Extrae el canal Y de un Bitmap (luminancia)
+     */
+    private fun extractYChannelFromBitmap(bitmap: Bitmap): ByteArray {
+        val width = bitmap.width
+        val height = bitmap.height
+        val yBuffer = ByteArray(width * height)
+        
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val pixel = bitmap.getPixel(x, y)
+                val r = (pixel shr 16) and 0xFF
+                val g = (pixel shr 8) and 0xFF
+                val b = pixel and 0xFF
+                
+                // Convertir RGB a Y (luminancia) usando fórmula estándar
+                val yValue = (0.299 * r + 0.587 * g + 0.114 * b).toInt().coerceIn(0, 255)
+                yBuffer[y * width + x] = yValue.toByte()
+            }
+        }
+        
+        return yBuffer
+    }
+    
+    /**
+     * Analiza el contraste de una fila desde un buffer Y
+     */
+    private fun analyzeRowContrastFromYBuffer(rowY: Int, yBuffer: ByteArray, imageWidth: Int, downsampledWidth: Int): IntArray {
+        val contrastProfile = IntArray(downsampledWidth)
+        
+        try {
+            for (x in 0 until imageWidth step DOWNSAMPLE_FACTOR) {
+                val downsampledX = x / DOWNSAMPLE_FACTOR
+                if (downsampledX >= downsampledWidth) break
+                
+                // Calculate local contrast using Sobel-like operator
+                val left = max(0, x - DOWNSAMPLE_FACTOR)
+                val right = min(imageWidth - 1, x + DOWNSAMPLE_FACTOR)
+                
+                if (left >= right) continue
+                
+                val leftY = yBuffer[rowY * imageWidth + left].toInt() and 0xFF
+                val rightY = yBuffer[rowY * imageWidth + right].toInt() and 0xFF
+                val centerY = yBuffer[rowY * imageWidth + x].toInt() and 0xFF
+                
+                val contrast = abs(centerY - leftY) + abs(centerY - rightY)
+                contrastProfile[downsampledX] = contrast
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error analyzing row contrast from Y buffer at y=$rowY", e)
+        }
+        
+        return contrastProfile
     }
     
     private fun analyzeRowContrast(rowY: Int, yBuffer: java.nio.ByteBuffer, yRowStride: Int, imageWidth: Int, downsampledWidth: Int): IntArray {

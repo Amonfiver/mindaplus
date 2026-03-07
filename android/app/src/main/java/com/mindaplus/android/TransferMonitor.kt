@@ -1,5 +1,6 @@
 package com.mindaplus.android
 
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.media.Image
 import android.util.Log
@@ -16,6 +17,66 @@ class TransferMonitor(
     private val templateStorage = TemplateStorage(context)
     private val templateClassifier = TemplateClassifier(templateStorage)
     private val stateConfirmation = StateConfirmation()
+
+    fun analyzeFrame(bitmap: Bitmap): Map<Int, TransferState> {
+        try {
+            Log.d(TAG, "Analyzing bitmap frame ${bitmap.width}x${bitmap.height}")
+
+            // Step 1: Auto-detect lanes (calibrate once and freeze)
+            val laneDetection = laneDetector.detectLanes(bitmap)
+
+            if (laneDetection.requiresCalibration || laneDetection.lanes == null) {
+                Log.w(TAG, "Lane detection failed or requires calibration")
+                return getDefaultStates()
+            }
+
+            val lanes = laneDetection.lanes
+            if (lanes.size != 3) {
+                Log.w(TAG, "Expected 3 lanes, got ${lanes.size}")
+                return getDefaultStates()
+            }
+
+            Log.d(TAG, "Detected ${lanes.size} lanes successfully")
+
+            // Step 2: Classify each lane using template matching
+            val results = mutableMapOf<Int, TransferState>()
+            val transferIds = listOf(100, 200, 300)
+
+            for (i in transferIds.indices) {
+                val transferId = transferIds[i]
+                val lane = lanes[i]
+
+                // Classify the ROI
+                val classification = templateClassifier.classifyROI(
+                    bitmap, lane, transferId
+                )
+
+                Log.d(TAG, "Transfer $transferId: detected=${classification.state}, similarity=${classification.similarity}, confident=${classification.isConfident}")
+
+                // Use detected state only if confident, otherwise UNKNOWN
+                val detectedState = if (classification.isConfident) {
+                    classification.state
+                } else {
+                    TransferState.UNKNOWN
+                }
+
+                // Step 3: Apply 2-tick confirmation logic
+                val confirmation = stateConfirmation.processState(transferId, detectedState)
+
+                Log.d(TAG, "Transfer $transferId: confirmed=${confirmation.confirmedState}, pending=${confirmation.pendingTicks}, changed=${confirmation.isStateChanged}")
+
+                // Use confirmed state, or previous state if not confirmed
+                results[transferId] = confirmation.confirmedState ?: TransferState.UNKNOWN
+            }
+
+            Log.d(TAG, "Bitmap frame analysis complete: $results")
+            return results
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error analyzing bitmap frame", e)
+            return getDefaultStates()
+        }
+    }
     
     fun analyzeFrame(image: Image, imageWidth: Int, imageHeight: Int): Map<Int, TransferState> {
         try {

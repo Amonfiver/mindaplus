@@ -2,6 +2,7 @@ package com.mindaplus.android
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -109,15 +110,15 @@ class MainActivity : ComponentActivity() {
         cameraManager.startCamera(
             lifecycleOwner = this,
             previewView = previewView,
-            onFrameAnalyzed = { image ->
+            onFrameAnalyzed = { bitmap ->
                 if (isMonitoring) {
-                    analyzeCameraFrame(image)
+                    analyzeCameraFrame(bitmap)
                 }
             }
         )
     }
 
-    private fun analyzeCameraFrame(image: android.media.Image) {
+    private fun analyzeCameraFrame(bitmap: Bitmap) {
         val currentTime = System.currentTimeMillis()
         val timeSinceLastAnalysis = currentTime - lastAnalysisTime
         
@@ -132,13 +133,13 @@ class MainActivity : ComponentActivity() {
         
         lifecycleScope.launch {
             try {
-                val imageWidth = image.width
-                val imageHeight = image.height
-                
+                val imageWidth = bitmap.width
+                val imageHeight = bitmap.height
+
                 Log.d("Mindaplus", "MainActivity: Analyzing frame ${imageWidth}x${imageHeight}")
-                
-                // Analyze frame using TransferMonitor
-                val newStates = transferMonitor.analyzeFrame(image, imageWidth, imageHeight)
+
+                // Analyze frame directly as Bitmap (safe after ImageProxy close)
+                val newStates = transferMonitor.analyzeFrame(bitmap)
                 
                 Log.d("Mindaplus", "MainActivity: Analysis results: $newStates")
                 

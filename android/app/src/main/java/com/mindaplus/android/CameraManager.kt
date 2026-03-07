@@ -1,9 +1,11 @@
 package com.mindaplus.android
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.util.Log
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -18,7 +20,7 @@ class CameraManager(private val context: Context) {
     fun startCamera(
         lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
-        onFrameAnalyzed: (android.media.Image) -> Unit
+        onFrameAnalyzed: (Bitmap) -> Unit
     ) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         
@@ -40,16 +42,18 @@ class CameraManager(private val context: Context) {
                     .also {
                         it.setAnalyzer(executor) { imageProxy ->
                             try {
-                                val image = imageProxy.image
-                                if (image != null) {
-                                    Log.d("Mindaplus", "CameraX: Frame received, format=${image.format}, size=${image.width}x${image.height}")
-                                    onFrameAnalyzed(image)
+                                // Convertir ImageProxy a Bitmap ANTES de cerrar el ImageProxy
+                                val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
+                                if (bitmap != null) {
+                                    Log.d("Mindaplus", "CameraX: Frame converted to bitmap, size=${bitmap.width}x${bitmap.height}")
+                                    onFrameAnalyzed(bitmap)
                                 } else {
-                                    Log.w("Mindaplus", "CameraX: ImageProxy.image is null")
+                                    Log.w("Mindaplus", "CameraX: Failed to convert ImageProxy to bitmap")
                                 }
                             } catch (e: Exception) {
                                 Log.e("Mindaplus", "CameraX: Error analyzing image", e)
                             } finally {
+                                // Cerrar ImageProxy después de la conversión
                                 imageProxy.close()
                                 Log.d("Mindaplus", "CameraX: ImageProxy closed")
                             }

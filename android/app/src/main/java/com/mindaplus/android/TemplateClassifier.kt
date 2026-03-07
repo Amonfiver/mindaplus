@@ -21,6 +21,57 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         val similarity: Float,
         val isConfident: Boolean
     )
+
+    fun classifyROI(bitmap: Bitmap, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
+        try {
+            // Load templates for this transfer
+            val templates = mutableMapOf<TransferState, Bitmap>()
+            var templateCount = 0
+
+            for (state in listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)) {
+                val template = templateStorage.loadTemplate(transferId, state)
+                if (template != null) {
+                    templates[state] = template
+                    templateCount++
+                }
+            }
+
+            if (templateCount == 0) {
+                Log.w(TAG, "No templates found for transfer $transferId")
+                return ClassificationResult(TransferState.UNKNOWN, 0f, false)
+            }
+
+            // Extract and normalize ROI from current frame
+            val currentROI = extractROI(bitmap, roi)
+            if (currentROI == null) {
+                Log.w(TAG, "Failed to extract ROI for transfer $transferId")
+                return ClassificationResult(TransferState.UNKNOWN, 0f, false)
+            }
+
+            // Compare with each template and find best match
+            var bestState = TransferState.UNKNOWN
+            var bestSimilarity = 0f
+
+            for ((state, template) in templates) {
+                val similarity = calculateSimilarity(currentROI, template)
+                Log.d(TAG, "Transfer $transferId $state similarity: $similarity")
+
+                if (similarity > bestSimilarity) {
+                    bestSimilarity = similarity
+                    bestState = state
+                }
+            }
+
+            val isConfident = bestSimilarity >= SIMILARITY_THRESHOLD
+            Log.d(TAG, "Transfer $transferId classified as $bestState (similarity: $bestSimilarity, confident: $isConfident)")
+
+            return ClassificationResult(bestState, bestSimilarity, isConfident)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
+            return ClassificationResult(TransferState.UNKNOWN, 0f, false)
+        }
+    }
     
     fun classifyROI(image: Image, imageWidth: Int, imageHeight: Int, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
         try {
@@ -115,6 +166,49 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
             
         } catch (e: Exception) {
             Log.e(TAG, "Error extracting ROI", e)
+            return null
+        }
+    }
+
+    private fun extractROI(bitmap: Bitmap, roi: LaneDetector.LaneRegion): Bitmap? {
+        try {
+            val imageWidth = bitmap.width
+            val imageHeight = bitmap.height
+
+            // Ensure ROI is within bounds
+            val left = max(0, min(roi.left, imageWidth - 1))
+            val top = max(0, min(roi.top, imageHeight - 1))
+            val right = max(left + 1, min(roi.right, imageWidth))
+            val bottom = max(top + 1, min(roi.bottom, imageHeight))
+
+            val roiWidth = right - left
+            val roiHeight = bottom - top
+
+            if (roiWidth <= 0 || roiHeight <= 0) {
+                Log.w(TAG, "Invalid ROI dimensions: ${roiWidth}x${roiHeight}")
+                return null
+            }
+
+            // Create grayscale bitmap for consistent template matching
+            val roiBitmap = Bitmap.createBitmap(roiWidth, roiHeight, Bitmap.Config.ARGB_8888)
+
+            for (y in top until bottom) {
+                for (x in left until right) {
+                    val pixel = bitmap.getPixel(x, y)
+                    val r = (pixel shr 16) and 0xFF
+                    val g = (pixel shr 8) and 0xFF
+                    val b = pixel and 0xFF
+                    val gray = (0.299 * r + 0.587 * g + 0.114 * b).toInt().coerceIn(0, 255)
+                    val grayPixel = gray or (gray shl 8) or (gray shl 16) or (0xFF shl 24)
+                    roiBitmap.setPixel(x - left, y - top, grayPixel)
+                }
+            }
+
+            // Resize to template size
+            return Bitmap.createScaledBitmap(roiBitmap, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting ROI from bitmap", e)
             return null
         }
     }

@@ -1,9 +1,6 @@
 package com.mindaplus.android
 
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.Rect
 import android.media.Image
 import android.os.Bundle
 import android.util.Log
@@ -38,11 +35,12 @@ class TrainingActivity : ComponentActivity() {
     private var selectedState by mutableStateOf(TransferState.OK)
     private var trainingProgress by mutableStateOf(0 to 9)
     private var isCapturing by mutableStateOf(false)
-    private var lastCapturedImage by mutableStateOf<Image?>(null)
+    private var lastCapturedBitmap by mutableStateOf<Bitmap?>(null)
     private var capturedTemplatePreview by mutableStateOf<Bitmap?>(null)
     private var detectedLaneRegion by mutableStateOf<LaneDetector.LaneRegion?>(null)
     private var lastCapturedTransfer by mutableStateOf<Int?>(null)
     private var lastCapturedState by mutableStateOf<TransferState?>(null)
+    private var pendingTemplateBitmap by mutableStateOf<Bitmap?>(null)
     
     companion object {
         private const val TAG = "TrainingActivity"
@@ -93,9 +91,9 @@ class TrainingActivity : ComponentActivity() {
         cameraManager.startCamera(
             lifecycleOwner = this,
             previewView = previewView,
-            onFrameAnalyzed = { image ->
-                // Store the latest image for template capture
-                lastCapturedImage = image
+            onFrameAnalyzed = { bitmap ->
+                // Store the latest bitmap for template capture
+                lastCapturedBitmap = bitmap
             }
         )
     }
@@ -406,18 +404,18 @@ class TrainingActivity : ComponentActivity() {
         
         lifecycleScope.launch {
             try {
-                val image = lastCapturedImage
-                if (image == null) {
-                    Log.w(TAG, "No image available for template capture")
+                val bitmap = lastCapturedBitmap
+                if (bitmap == null) {
+                    Log.w(TAG, "No bitmap available for template capture")
                     showMessage("No hay imagen disponible para captura")
                     isCapturing = false
                     return@launch
                 }
                 
-                Log.d(TAG, "Processing image for template capture: ${image.width}x${image.height}")
+                Log.d(TAG, "Processing bitmap for template capture: ${bitmap.width}x${bitmap.height}")
                 
                 // Step 1: Detect lanes to find the correct region for this transfer
-                val laneDetection = laneDetector.detectLanes(image, image.width, image.height)
+                val laneDetection = laneDetector.detectLanes(bitmap)
                 if (laneDetection.requiresCalibration || laneDetection.lanes == null) {
                     Log.e(TAG, "Lane detection failed - cannot capture template")
                     showMessage("Error: No se pudieron detectar las vías")
@@ -451,43 +449,26 @@ class TrainingActivity : ComponentActivity() {
                 val targetLane = lanes[targetLaneIndex]
                 Log.d(TAG, "Selected lane $targetLaneIndex for T$selectedTransfer: $targetLane")
                 
-                // Step 3: Convert image to bitmap and crop to detected region
-                val fullBitmap = imageToBitmap(image)
-                if (fullBitmap == null) {
-                    Log.e(TAG, "Failed to convert image to bitmap")
-                    showMessage("Error al procesar imagen")
-                    isCapturing = false
-                    return@launch
-                }
-                
-                // Step 4: Crop to the detected lane region
-                val croppedBitmap = cropToRegion(fullBitmap, targetLane)
+                // Step 3: Crop bitmap to the detected lane region
+                val croppedBitmap = ImageUtils.cropBitmap(bitmap, targetLane.left, targetLane.top, targetLane.right, targetLane.bottom)
                 if (croppedBitmap == null) {
-                    Log.e(TAG, "Failed to crop image to lane region")
+                    Log.e(TAG, "Failed to crop bitmap to lane region")
                     showMessage("Error al recortar la región")
                     isCapturing = false
                     return@launch
                 }
                 
-                Log.d(TAG, "Successfully cropped image to ${croppedBitmap.width}x${croppedBitmap.height}")
+                Log.d(TAG, "Successfully cropped bitmap to ${croppedBitmap.width}x${croppedBitmap.height}")
                 
-                // Step 5: Save the cropped template
-                val success = templateStorage.saveTemplate(selectedTransfer, selectedState, croppedBitmap)
-                if (success) {
-                    Log.d(TAG, "Template saved successfully for T$selectedTransfer ${selectedState.displayName}")
-                    
-                    // Update UI with preview and region info
-                    capturedTemplatePreview = croppedBitmap
-                    detectedLaneRegion = targetLane
-                    lastCapturedTransfer = selectedTransfer
-                    lastCapturedState = selectedState
-                    
-                    updateTrainingProgress()
-                    showMessage("Template capturado exitosamente - Región detectada: ${targetLane.left},${targetLane.top} a ${targetLane.right},${targetLane.bottom}")
-                } else {
-                    Log.e(TAG, "Failed to save template to storage")
-                    showMessage("Error al guardar el template")
-                }
+                // Step 4: Store the cropped template for preview (NO guardar todavía)
+                // Update UI with preview and region info
+                capturedTemplatePreview = croppedBitmap
+                detectedLaneRegion = targetLane
+                lastCapturedTransfer = selectedTransfer
+                lastCapturedState = selectedState
+                pendingTemplateBitmap = croppedBitmap // Guardar para cuando se pulse "Guardar"
+                
+                showMessage("Template capturado exitosamente - Región detectada: ${targetLane.left},${targetLane.top} a ${targetLane.right},${targetLane.bottom}")
                 
             } catch (e: Exception) {
                 Log.e(TAG, "Error capturing template", e)
@@ -528,6 +509,7 @@ class TrainingActivity : ComponentActivity() {
         detectedLaneRegion = null
         lastCapturedTransfer = null
         lastCapturedState = null
+        pendingTemplateBitmap = null // Limpiar template pendiente
         showMessage("Captura cancelada")
     }
     
@@ -536,19 +518,45 @@ class TrainingActivity : ComponentActivity() {
         
         lifecycleScope.launch {
             try {
-                // Training data is already saved with each template capture
-                // Just verify we have the expected progress
-                val progress = templateStorage.getTrainingProgress()
-                if (progress.first == progress.second) {
-                    Log.d(TAG, "Training complete: ${progress.first}/${progress.second} templates")
-                    showMessage("Entrenamiento completado exitosamente")
-                } else {
-                    Log.d(TAG, "Training saved: ${progress.first}/${progress.second} templates")
-                    showMessage("Progreso guardado: ${progress.first}/${progress.second} templates")
+                // Verificar que tenemos un template pendiente para guardar
+                val templateBitmap = pendingTemplateBitmap
+                val transfer = lastCapturedTransfer
+                val state = lastCapturedState
+                
+                if (templateBitmap == null || transfer == null || state == null) {
+                    Log.e(TAG, "No pending template to save")
+                    showMessage("Error: No hay template pendiente para guardar")
+                    return@launch
                 }
                 
-                setResult(RESULT_OK)
-                finish()
+                // Guardar el template en TemplateStorage
+                val success = templateStorage.saveTemplate(transfer, state, templateBitmap)
+                if (success) {
+                    Log.d(TAG, "Template saved successfully for T$transfer ${state.displayName}")
+                    
+                    // Actualizar progreso
+                    updateTrainingProgress()
+                    
+                    // Verificar si el entrenamiento está completo
+                    val progress = templateStorage.getTrainingProgress()
+                    if (progress.first == progress.second) {
+                        Log.d(TAG, "Training complete: ${progress.first}/${progress.second} templates")
+                        showMessage("Entrenamiento completado exitosamente")
+                    } else {
+                        Log.d(TAG, "Training saved: ${progress.first}/${progress.second} templates")
+                        showMessage("Template guardado: ${progress.first}/${progress.second} templates")
+                    }
+                    
+                    // Limpiar el template pendiente
+                    pendingTemplateBitmap = null
+                    
+                    // Cerrar activity con resultado OK
+                    setResult(RESULT_OK)
+                    finish()
+                } else {
+                    Log.e(TAG, "Failed to save template to storage")
+                    showMessage("Error al guardar el template")
+                }
                 
             } catch (e: Exception) {
                 Log.e(TAG, "Error saving training data", e)
