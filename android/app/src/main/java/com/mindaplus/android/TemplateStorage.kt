@@ -7,21 +7,33 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.random.Random
 
 class TemplateStorage(private val context: Context) {
     companion object {
         private const val TAG = "TemplateStorage"
         private const val TEMPLATES_DIR = "templates"
         private const val MANIFEST_FILE = "manifest.json"
-        private const val TEMPLATE_VERSION = "0.2"
+        private const val TEMPLATE_VERSION = "0.3"
         private const val TEMPLATE_WIDTH = 128
         private const val TEMPLATE_HEIGHT = 64
+        private val TRAINING_TRANSFERS = listOf(100, 200, 300)
+        private val TRAINING_STATES = listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)
     }
     
     data class TemplateManifest(
         val version: String,
         val timestamp: Long,
-        val templates: Map<String, Boolean>
+        val baseCoverage: Map<String, Boolean>,
+        val sampleCounts: Map<String, Int>,
+        val totalSamples: Int
+    )
+
+    data class TrainingStats(
+        val baseCovered: Int,
+        val baseTotal: Int,
+        val totalSamples: Int,
+        val sampleCounts: Map<String, Int>
     )
     
     private val templatesDir: File by lazy {
@@ -60,23 +72,22 @@ class TemplateStorage(private val context: Context) {
     }
     
     fun loadTemplate(transferId: Int, state: TransferState): Bitmap? {
+        return loadTemplates(transferId, state).firstOrNull()
+    }
+
+    fun loadTemplates(transferId: Int, state: TransferState): List<Bitmap> {
         try {
             if (state == TransferState.UNKNOWN) {
-                return null
+                return emptyList()
             }
-            
-            val filename = getTemplateFilename(transferId, state)
-            val file = File(templatesDir, filename)
-            
-            if (!file.exists()) {
-                return null
-            }
-            
-            return BitmapFactory.decodeFile(file.absolutePath)
-            
+
+            val files = listTemplateFilesForClass(transferId, state)
+            val bitmaps = files.mapNotNull { BitmapFactory.decodeFile(it.absolutePath) }
+            Log.d(TAG, "Loaded ${bitmaps.size} templates for T$transferId ${state.displayName}")
+            return bitmaps
         } catch (e: Exception) {
             Log.e(TAG, "Error loading template for T$transferId $state", e)
-            return null
+            return emptyList()
         }
     }
     
@@ -84,19 +95,14 @@ class TemplateStorage(private val context: Context) {
         val templates = mutableMapOf<String, Bitmap>()
         
         try {
-            val manifest = loadManifest()
-            
-            for ((filename, exists) in manifest.templates) {
-                if (exists) {
-                    val file = File(templatesDir, filename)
-                    if (file.exists()) {
-                        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
-                        if (bitmap != null) {
-                            templates[filename] = bitmap
-                        }
+            templatesDir.listFiles()
+                ?.filter { it.isFile && it.name.endsWith(".png", ignoreCase = true) }
+                ?.forEach { file ->
+                    val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                    if (bitmap != null) {
+                        templates[file.name] = bitmap
                     }
                 }
-            }
             
         } catch (e: Exception) {
             Log.e(TAG, "Error loading all templates", e)
@@ -106,30 +112,45 @@ class TemplateStorage(private val context: Context) {
     }
     
     fun isTrained(): Boolean {
-        try {
-            val manifest = loadManifest()
-            val requiredTemplates = 9 // 3 transfers × 3 states
-            val trainedCount = manifest.templates.values.count { it }
-            
-            return trainedCount == requiredTemplates
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error checking training status", e)
-            return false
-        }
+        val stats = getTrainingStats()
+        return stats.baseCovered == stats.baseTotal
     }
     
     fun getTrainingProgress(): Pair<Int, Int> {
-        try {
-            val manifest = loadManifest()
-            val trainedCount = manifest.templates.values.count { it }
-            val totalCount = 9 // 3 transfers × 3 states
-            
-            return trainedCount to totalCount
-            
+        val stats = getTrainingStats()
+        return stats.baseCovered to stats.baseTotal
+    }
+
+    fun getTrainingStats(): TrainingStats {
+        return try {
+            val sampleCounts = mutableMapOf<String, Int>()
+            var covered = 0
+            var totalSamples = 0
+
+            for (transferId in TRAINING_TRANSFERS) {
+                for (state in TRAINING_STATES) {
+                    val key = getBaseKey(transferId, state)
+                    val count = listTemplateFilesForClass(transferId, state).size
+                    sampleCounts[key] = count
+                    totalSamples += count
+                    if (count > 0) covered++
+                }
+            }
+
+            TrainingStats(
+                baseCovered = covered,
+                baseTotal = TRAINING_TRANSFERS.size * TRAINING_STATES.size,
+                totalSamples = totalSamples,
+                sampleCounts = sampleCounts
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting training progress", e)
-            return 0 to 9
+            Log.e(TAG, "Error getting training stats", e)
+            TrainingStats(
+                baseCovered = 0,
+                baseTotal = TRAINING_TRANSFERS.size * TRAINING_STATES.size,
+                totalSamples = 0,
+                sampleCounts = emptyMap()
+            )
         }
     }
     
@@ -150,31 +171,60 @@ class TemplateStorage(private val context: Context) {
     }
     
     private fun getTemplateFilename(transferId: Int, state: TransferState): String {
+        val suffix = getStateSuffix(state)
+        val timestamp = System.currentTimeMillis()
+        val randomId = Random.nextInt(1000, 9999)
+        return "tpl_t${transferId}_${suffix}_${timestamp}_$randomId.png"
+    }
+
+    private fun listTemplateFilesForClass(transferId: Int, state: TransferState): List<File> {
+        if (state == TransferState.UNKNOWN) return emptyList()
+        val suffix = getStateSuffix(state)
+        val prefix = "tpl_t${transferId}_${suffix}_"
+        val legacyName = "tpl_t${transferId}_${suffix}.png"
+
+        return templatesDir.listFiles()
+            ?.filter {
+                it.isFile && (
+                    (it.name.startsWith(prefix) && it.name.endsWith(".png", ignoreCase = true)) ||
+                        it.name.equals(legacyName, ignoreCase = true)
+                    )
+            }
+            ?.sortedByDescending { it.lastModified() }
+            ?: emptyList()
+    }
+
+    private fun getBaseKey(transferId: Int, state: TransferState): String {
+        return "t${transferId}_${getStateSuffix(state)}"
+    }
+
+    private fun getStateSuffix(state: TransferState): String {
         return when (state) {
-            TransferState.OK -> "tpl_t${transferId}_ok.png"
-            TransferState.OBSTACULO -> "tpl_t${transferId}_obst.png"
-            TransferState.FALLO -> "tpl_t${transferId}_fallo.png"
-            TransferState.UNKNOWN -> throw IllegalArgumentException("Cannot create template for UNKNOWN state")
+            TransferState.OK -> "ok"
+            TransferState.OBSTACULO -> "obst"
+            TransferState.FALLO -> "fallo"
+            TransferState.UNKNOWN -> throw IllegalArgumentException("UNKNOWN has no template suffix")
         }
     }
-    
+
     private fun updateManifest() {
         try {
-            val templates = mutableMapOf<String, Boolean>()
-            
-            // Check all required template files
-            for (transferId in listOf(100, 200, 300)) {
-                for (state in listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)) {
-                    val filename = getTemplateFilename(transferId, state)
-                    val file = File(templatesDir, filename)
-                    templates[filename] = file.exists()
+            val stats = getTrainingStats()
+            val baseCoverage = mutableMapOf<String, Boolean>()
+            for (transferId in TRAINING_TRANSFERS) {
+                for (state in TRAINING_STATES) {
+                    val key = getBaseKey(transferId, state)
+                    val count = stats.sampleCounts[key] ?: 0
+                    baseCoverage[key] = count > 0
                 }
             }
-            
+
             val manifest = TemplateManifest(
                 version = TEMPLATE_VERSION,
                 timestamp = System.currentTimeMillis(),
-                templates = templates
+                baseCoverage = baseCoverage,
+                sampleCounts = stats.sampleCounts,
+                totalSamples = stats.totalSamples
             )
             
             val manifestFile = File(templatesDir, MANIFEST_FILE)
@@ -182,50 +232,14 @@ class TemplateStorage(private val context: Context) {
                 JSONObject().apply {
                     put("version", manifest.version)
                     put("timestamp", manifest.timestamp)
-                    put("templates", JSONObject(manifest.templates))
+                    put("baseCoverage", JSONObject(manifest.baseCoverage))
+                    put("sampleCounts", JSONObject(manifest.sampleCounts))
+                    put("totalSamples", manifest.totalSamples)
                 }.toString()
             )
             
         } catch (e: Exception) {
             Log.e(TAG, "Error updating manifest", e)
-        }
-    }
-    
-    private fun loadManifest(): TemplateManifest {
-        try {
-            val manifestFile = File(templatesDir, MANIFEST_FILE)
-            
-            if (!manifestFile.exists()) {
-                // Return empty manifest if file doesn't exist
-                return TemplateManifest(
-                    version = TEMPLATE_VERSION,
-                    timestamp = System.currentTimeMillis(),
-                    templates = emptyMap()
-                )
-            }
-            
-            val jsonString = manifestFile.readText()
-            val json = JSONObject(jsonString)
-            
-            val templates = mutableMapOf<String, Boolean>()
-            val templatesJson = json.getJSONObject("templates")
-            for (key in templatesJson.keys()) {
-                templates[key] = templatesJson.getBoolean(key)
-            }
-            
-            return TemplateManifest(
-                version = json.getString("version"),
-                timestamp = json.getLong("timestamp"),
-                templates = templates
-            )
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error loading manifest", e)
-            return TemplateManifest(
-                version = TEMPLATE_VERSION,
-                timestamp = System.currentTimeMillis(),
-                templates = emptyMap()
-            )
         }
     }
 }

@@ -41,10 +41,18 @@ class MainActivity : ComponentActivity() {
     private var previewView by mutableStateOf<PreviewView?>(null)
     private var isTrained by mutableStateOf(false)
     private var trainingProgress by mutableStateOf(0 to 9)
+    private var totalTrainingSamples by mutableStateOf(0)
     
     // 5-second throttle mechanism
     private var lastAnalysisTime = 0L
     private val analysisInterval = 5000L // 5 seconds as specified in v0.1
+    private var isAnalysisInProgress = false
+
+    // Alerting policy
+    private val issueStates = setOf(TransferState.OBSTACULO, TransferState.FALLO)
+    private val reAlertCooldownMs = 60_000L
+    private val lastAlertTimestampByTransfer = mutableMapOf<Int, Long>()
+    private val lastAlertStateByTransfer = mutableMapOf<Int, TransferState>()
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -82,6 +90,11 @@ class MainActivity : ComponentActivity() {
         checkCameraPermission()
         
         // Update training status
+        updateTrainingStatus()
+    }
+
+    override fun onResume() {
+        super.onResume()
         updateTrainingStatus()
     }
 
@@ -127,9 +140,15 @@ class MainActivity : ComponentActivity() {
             Log.d("Mindaplus", "MainActivity: Frame skipped due to throttle (${timeSinceLastAnalysis}ms < ${analysisInterval}ms)")
             return
         }
+
+        if (isAnalysisInProgress) {
+            Log.d("Mindaplus", "MainActivity: Frame skipped because previous analysis is still running")
+            return
+        }
         
         lastAnalysisTime = currentTime
-        Log.d("Mindaplus", "MainActivity: Analysis tick - processing frame after ${timeSinceLastAnalysis}ms")
+        isAnalysisInProgress = true
+        Log.d("Mindaplus", "MainActivity: Analysis tick at ts=$currentTime (delta=${timeSinceLastAnalysis}ms)")
         
         lifecycleScope.launch {
             try {
@@ -146,9 +165,8 @@ class MainActivity : ComponentActivity() {
                 // Check for state changes and send notifications
                 newStates.forEach { (transferId, newState) ->
                     val oldState = transferStates[transferId]
-                    if (oldState != newState) {
-                        Log.d("Mindaplus", "MainActivity: Transfer $transferId state changed from $oldState to $newState")
-                        sendNotification(transferId, oldState!!, newState)
+                    if (oldState != null) {
+                        evaluateAndNotify(transferId, oldState, newState, currentTime)
                     }
                 }
                 
@@ -157,6 +175,8 @@ class MainActivity : ComponentActivity() {
                 
             } catch (e: Exception) {
                 Log.e("Mindaplus", "MainActivity: Error analyzing camera frame", e)
+            } finally {
+                isAnalysisInProgress = false
             }
         }
     }
@@ -328,6 +348,22 @@ class MainActivity : ComponentActivity() {
                                 fontWeight = FontWeight.Bold
                             )
                         }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Muestras:",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+
+                            Text(
+                                text = "$totalTrainingSamples",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                         
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -426,34 +462,93 @@ class MainActivity : ComponentActivity() {
     }
     
     private fun updateTrainingStatus() {
-        isTrained = transferMonitor.isTrained()
-        trainingProgress = transferMonitor.getTrainingProgress()
-        Log.d("Mindaplus", "MainActivity: Training status updated - trained: $isTrained, progress: ${trainingProgress.first}/${trainingProgress.second}")
+        val stats = transferMonitor.getTrainingStats()
+        isTrained = stats.baseCovered == stats.baseTotal
+        trainingProgress = stats.baseCovered to stats.baseTotal
+        totalTrainingSamples = stats.totalSamples
+        Log.d(
+            "Mindaplus",
+            "MainActivity: Training status updated - trained=$isTrained base=${trainingProgress.first}/${trainingProgress.second} samples=$totalTrainingSamples"
+        )
     }
 
-    private fun sendNotification(transferId: Int, oldState: TransferState, newState: TransferState) {
+    private fun evaluateAndNotify(
+        transferId: Int,
+        oldState: TransferState,
+        newState: TransferState,
+        nowTs: Long
+    ) {
+        val lastAlertTs = lastAlertTimestampByTransfer[transferId]
+        val lastAlertState = lastAlertStateByTransfer[transferId]
+        Log.d(
+            "Mindaplus",
+            "MainActivity: Notification decision T$transferId old=$oldState new=$newState analysisTs=$nowTs lastAlertTs=$lastAlertTs lastAlertState=$lastAlertState"
+        )
+
+        if (newState in issueStates) {
+            val isNewIssueTransition = oldState != newState || oldState !in issueStates
+            if (isNewIssueTransition) {
+                sendNotification(transferId, oldState, newState, "state_change_issue")
+                lastAlertTimestampByTransfer[transferId] = nowTs
+                lastAlertStateByTransfer[transferId] = newState
+                return
+            }
+
+            val canReAlert = lastAlertTs == null || (nowTs - lastAlertTs) >= reAlertCooldownMs
+            if (canReAlert) {
+                sendNotification(transferId, oldState, newState, "persistent_realert")
+                lastAlertTimestampByTransfer[transferId] = nowTs
+                lastAlertStateByTransfer[transferId] = newState
+            } else {
+                val elapsedSinceAlert = nowTs - (lastAlertTs ?: nowTs)
+                Log.d(
+                    "Mindaplus",
+                    "MainActivity: Skipping Telegram for T$transferId (cooldown active ${elapsedSinceAlert}ms < ${reAlertCooldownMs}ms)"
+                )
+            }
+            return
+        }
+
+        if (oldState in issueStates && newState == TransferState.OK) {
+            sendNotification(transferId, oldState, newState, "recovery")
+            lastAlertTimestampByTransfer.remove(transferId)
+            lastAlertStateByTransfer.remove(transferId)
+            return
+        }
+
+        Log.d("Mindaplus", "MainActivity: No Telegram notification for T$transferId old=$oldState new=$newState")
+    }
+
+    private fun sendNotification(
+        transferId: Int,
+        oldState: TransferState,
+        newState: TransferState,
+        reason: String
+    ) {
         val message = when {
-            oldState == TransferState.OK && newState == TransferState.OBSTACULO -> 
+            newState == TransferState.OBSTACULO && oldState != TransferState.OBSTACULO ->
                 "Transfer $transferId parado, obstáculo en la vía."
-            oldState == TransferState.OBSTACULO && newState == TransferState.OK -> 
-                "Transfer $transferId rearmado, todo OK."
-            newState == TransferState.FALLO -> 
+            newState == TransferState.FALLO && oldState != TransferState.FALLO ->
                 "Transfer $transferId en fallo."
+            newState in issueStates && oldState == newState ->
+                "Recordatorio: Transfer $transferId sigue en ${newState.displayName}."
+            oldState in issueStates && newState == TransferState.OK ->
+                "Transfer $transferId rearmado, todo OK."
             else -> return
         }
-        
-        Log.d("Mindaplus", "MainActivity: Sending Telegram notification: $message")
-        
+
+        Log.d("Mindaplus", "MainActivity: Sending Telegram notification reason=$reason msg=$message")
+
         lifecycleScope.launch {
             try {
                 val success = telegramNotifier.sendMessage(message)
                 if (success) {
-                    Log.d("Mindaplus", "MainActivity: Telegram notification sent successfully")
+                    Log.d("Mindaplus", "MainActivity: Telegram notification sent successfully reason=$reason")
                 } else {
-                    Log.e("Mindaplus", "MainActivity: Failed to send Telegram notification")
+                    Log.e("Mindaplus", "MainActivity: Failed to send Telegram notification reason=$reason")
                 }
             } catch (e: Exception) {
-                Log.e("Mindaplus", "MainActivity: Exception sending Telegram notification", e)
+                Log.e("Mindaplus", "MainActivity: Exception sending Telegram notification reason=$reason", e)
             }
         }
     }

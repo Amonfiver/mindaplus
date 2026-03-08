@@ -20,7 +20,8 @@ class TransferMonitor(
 
     fun analyzeFrame(bitmap: Bitmap): Map<Int, TransferState> {
         try {
-            Log.d(TAG, "Analyzing bitmap frame ${bitmap.width}x${bitmap.height}")
+            val analysisTs = System.currentTimeMillis()
+            Log.d(TAG, "Analyzing bitmap frame ${bitmap.width}x${bitmap.height} at ts=$analysisTs")
 
             // Step 1: Auto-detect lanes (calibrate once and freeze)
             val laneDetection = laneDetector.detectLanes(bitmap)
@@ -69,7 +70,7 @@ class TransferMonitor(
                 results[transferId] = confirmation.confirmedState ?: TransferState.UNKNOWN
             }
 
-            Log.d(TAG, "Bitmap frame analysis complete: $results")
+            Log.d(TAG, "Bitmap frame analysis complete at ts=$analysisTs: $results")
             return results
 
         } catch (e: Exception) {
@@ -80,7 +81,8 @@ class TransferMonitor(
     
     fun analyzeFrame(image: Image, imageWidth: Int, imageHeight: Int): Map<Int, TransferState> {
         try {
-            Log.d(TAG, "Analyzing frame ${imageWidth}x${imageHeight}")
+            val analysisTs = System.currentTimeMillis()
+            Log.d(TAG, "Analyzing frame ${imageWidth}x${imageHeight} at ts=$analysisTs")
             
             if (image.format != ImageFormat.YUV_420_888) {
                 Log.w(TAG, "Unsupported image format: ${image.format}")
@@ -134,7 +136,7 @@ class TransferMonitor(
                 results[transferId] = confirmation.confirmedState ?: TransferState.UNKNOWN
             }
             
-            Log.d(TAG, "Frame analysis complete: $results")
+            Log.d(TAG, "Frame analysis complete at ts=$analysisTs: $results")
             return results
             
         } catch (e: Exception) {
@@ -149,6 +151,20 @@ class TransferMonitor(
     
     fun getTrainingProgress(): Pair<Int, Int> {
         return templateStorage.getTrainingProgress()
+    }
+
+    fun getTrainingStats(): TemplateStorage.TrainingStats {
+        return templateStorage.getTrainingStats()
+    }
+
+    fun addLabeledSample(transferId: Int, state: TransferState, bitmap: Bitmap): Boolean {
+        if (state == TransferState.UNKNOWN) {
+            Log.w(TAG, "Rejected labeled sample for UNKNOWN state")
+            return false
+        }
+        val success = templateStorage.saveTemplate(transferId, state, bitmap)
+        Log.d(TAG, "Labeled sample save result transfer=$transferId state=$state success=$success")
+        return success
     }
     
     fun clearTraining() {

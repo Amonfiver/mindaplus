@@ -13,7 +13,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         private const val TAG = "TemplateClassifier"
         private const val TEMPLATE_WIDTH = 128
         private const val TEMPLATE_HEIGHT = 64
-        private const val SIMILARITY_THRESHOLD = 0.7f // Minimum similarity for classification
+        private const val SIMILARITY_THRESHOLD = 0.72f
+        private const val AMBIGUITY_MARGIN = 0.035f
     }
     
     data class ClassificationResult(
@@ -24,48 +25,13 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
 
     fun classifyROI(bitmap: Bitmap, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
         try {
-            // Load templates for this transfer
-            val templates = mutableMapOf<TransferState, Bitmap>()
-            var templateCount = 0
-
-            for (state in listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)) {
-                val template = templateStorage.loadTemplate(transferId, state)
-                if (template != null) {
-                    templates[state] = template
-                    templateCount++
-                }
-            }
-
-            if (templateCount == 0) {
-                Log.w(TAG, "No templates found for transfer $transferId")
-                return ClassificationResult(TransferState.UNKNOWN, 0f, false)
-            }
-
             // Extract and normalize ROI from current frame
             val currentROI = extractROI(bitmap, roi)
             if (currentROI == null) {
                 Log.w(TAG, "Failed to extract ROI for transfer $transferId")
                 return ClassificationResult(TransferState.UNKNOWN, 0f, false)
             }
-
-            // Compare with each template and find best match
-            var bestState = TransferState.UNKNOWN
-            var bestSimilarity = 0f
-
-            for ((state, template) in templates) {
-                val similarity = calculateSimilarity(currentROI, template)
-                Log.d(TAG, "Transfer $transferId $state similarity: $similarity")
-
-                if (similarity > bestSimilarity) {
-                    bestSimilarity = similarity
-                    bestState = state
-                }
-            }
-
-            val isConfident = bestSimilarity >= SIMILARITY_THRESHOLD
-            Log.d(TAG, "Transfer $transferId classified as $bestState (similarity: $bestSimilarity, confident: $isConfident)")
-
-            return ClassificationResult(bestState, bestSimilarity, isConfident)
+            return classifyFromRoi(currentROI, transferId)
 
         } catch (e: Exception) {
             Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
@@ -75,53 +41,69 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
     
     fun classifyROI(image: Image, imageWidth: Int, imageHeight: Int, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
         try {
-            // Load templates for this transfer
-            val templates = mutableMapOf<TransferState, Bitmap>()
-            var templateCount = 0
-            
-            for (state in listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)) {
-                val template = templateStorage.loadTemplate(transferId, state)
-                if (template != null) {
-                    templates[state] = template
-                    templateCount++
-                }
-            }
-            
-            if (templateCount == 0) {
-                Log.w(TAG, "No templates found for transfer $transferId")
-                return ClassificationResult(TransferState.UNKNOWN, 0f, false)
-            }
-            
             // Extract and normalize ROI from current frame
             val currentROI = extractROI(image, imageWidth, imageHeight, roi)
             if (currentROI == null) {
                 Log.w(TAG, "Failed to extract ROI for transfer $transferId")
                 return ClassificationResult(TransferState.UNKNOWN, 0f, false)
             }
-            
-            // Compare with each template and find best match
-            var bestState = TransferState.UNKNOWN
-            var bestSimilarity = 0f
-            
-            for ((state, template) in templates) {
-                val similarity = calculateSimilarity(currentROI, template)
-                Log.d(TAG, "Transfer $transferId $state similarity: $similarity")
-                
-                if (similarity > bestSimilarity) {
-                    bestSimilarity = similarity
-                    bestState = state
-                }
-            }
-            
-            val isConfident = bestSimilarity >= SIMILARITY_THRESHOLD
-            Log.d(TAG, "Transfer $transferId classified as $bestState (similarity: $bestSimilarity, confident: $isConfident)")
-            
-            return ClassificationResult(bestState, bestSimilarity, isConfident)
+            return classifyFromRoi(currentROI, transferId)
             
         } catch (e: Exception) {
             Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
             return ClassificationResult(TransferState.UNKNOWN, 0f, false)
         }
+    }
+
+    private fun classifyFromRoi(currentROI: Bitmap, transferId: Int): ClassificationResult {
+        val classScores = mutableMapOf<TransferState, Float>()
+        val classSampleCounts = mutableMapOf<TransferState, Int>()
+
+        for (state in listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)) {
+            val templates = templateStorage.loadTemplates(transferId, state)
+            classSampleCounts[state] = templates.size
+
+            if (templates.isEmpty()) {
+                continue
+            }
+
+            val similarities = templates.map { template -> calculateSimilarity(currentROI, template) }
+            val bestSimilarity = similarities.maxOrNull() ?: 0f
+            val top2 = similarities.sortedDescending().take(2)
+            val avgTop = top2.average().toFloat()
+            val classScore = (bestSimilarity * 0.7f) + (avgTop * 0.3f)
+
+            classScores[state] = classScore
+            Log.d(
+                TAG,
+                "Transfer $transferId state=$state samples=${templates.size} best=${"%.4f".format(bestSimilarity)} avgTop=${"%.4f".format(avgTop)} score=${"%.4f".format(classScore)}"
+            )
+        }
+
+        if (classScores.isEmpty()) {
+            Log.w(TAG, "No templates found for transfer $transferId (all classes empty)")
+            return ClassificationResult(TransferState.UNKNOWN, 0f, false)
+        }
+
+        val ranked = classScores.entries.sortedByDescending { it.value }
+        val best = ranked[0]
+        val second = ranked.getOrNull(1)
+        val margin = if (second != null) best.value - second.value else best.value
+        val isConfident = best.value >= SIMILARITY_THRESHOLD && margin >= AMBIGUITY_MARGIN
+
+        if (!isConfident) {
+            Log.w(
+                TAG,
+                "Transfer $transferId ambiguous/low confidence. best=${best.key}:${"%.4f".format(best.value)} second=${second?.key}:${"%.4f".format(second?.value ?: 0f)} margin=${"%.4f".format(margin)} samples=$classSampleCounts"
+            )
+            return ClassificationResult(TransferState.UNKNOWN, best.value, false)
+        }
+
+        Log.d(
+            TAG,
+            "Transfer $transferId classified=${best.key} score=${"%.4f".format(best.value)} margin=${"%.4f".format(margin)} samples=$classSampleCounts"
+        )
+        return ClassificationResult(best.key, best.value, true)
     }
     
     private fun extractROI(image: Image, imageWidth: Int, imageHeight: Int, roi: LaneDetector.LaneRegion): Bitmap? {

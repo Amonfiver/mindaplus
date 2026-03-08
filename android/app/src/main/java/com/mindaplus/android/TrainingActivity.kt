@@ -34,6 +34,7 @@ class TrainingActivity : ComponentActivity() {
     private var selectedTransfer by mutableStateOf(100)
     private var selectedState by mutableStateOf(TransferState.OK)
     private var trainingProgress by mutableStateOf(0 to 9)
+    private var totalSamples by mutableStateOf(0)
     private var isCapturing by mutableStateOf(false)
     private var lastCapturedBitmap by mutableStateOf<Bitmap?>(null)
     private var capturedTemplatePreview by mutableStateOf<Bitmap?>(null)
@@ -99,7 +100,9 @@ class TrainingActivity : ComponentActivity() {
     }
     
     private fun updateTrainingProgress() {
-        trainingProgress = templateStorage.getTrainingProgress()
+        val stats = templateStorage.getTrainingStats()
+        trainingProgress = stats.baseCovered to stats.baseTotal
+        totalSamples = stats.totalSamples
     }
     
     @Composable
@@ -272,6 +275,17 @@ class TrainingActivity : ComponentActivity() {
                                 onClick = { selectedState = TransferState.FALLO },
                                 label = { Text("FALLO") },
                                 modifier = Modifier.weight(1f)
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Muestras totales:")
+                            Text(
+                                text = "$totalSamples",
+                                fontWeight = FontWeight.Bold
                             )
                         }
                     }
@@ -566,7 +580,7 @@ class TrainingActivity : ComponentActivity() {
                 }
                 
                 // Guardar el template en TemplateStorage
-                val success = templateStorage.saveTemplate(transfer, state, templateBitmap)
+                val success = transferMonitor.addLabeledSample(transfer, state, templateBitmap)
                 if (success) {
                     Log.d(TAG, "Template saved successfully for T$transfer ${state.displayName}")
                     
@@ -574,13 +588,13 @@ class TrainingActivity : ComponentActivity() {
                     updateTrainingProgress()
                     
                     // Verificar si el entrenamiento está completo
-                    val progress = templateStorage.getTrainingProgress()
-                    if (progress.first == progress.second) {
-                        Log.d(TAG, "Training complete: ${progress.first}/${progress.second} templates")
-                        showMessage("Entrenamiento completado exitosamente")
+                    val stats = templateStorage.getTrainingStats()
+                    if (stats.baseCovered == stats.baseTotal) {
+                        Log.d(TAG, "Training base complete: ${stats.baseCovered}/${stats.baseTotal} with ${stats.totalSamples} samples")
+                        showMessage("Template guardado. Base completa ${stats.baseCovered}/${stats.baseTotal}. Total muestras: ${stats.totalSamples}")
                     } else {
-                        Log.d(TAG, "Training saved: ${progress.first}/${progress.second} templates")
-                        showMessage("Template guardado: ${progress.first}/${progress.second} templates")
+                        Log.d(TAG, "Training saved: ${stats.baseCovered}/${stats.baseTotal}, samples=${stats.totalSamples}")
+                        showMessage("Template guardado: base ${stats.baseCovered}/${stats.baseTotal}, muestras ${stats.totalSamples}")
                     }
                     
                     clearPendingCaptureData()

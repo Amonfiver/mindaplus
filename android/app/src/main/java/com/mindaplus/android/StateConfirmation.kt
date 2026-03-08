@@ -6,6 +6,7 @@ class StateConfirmation {
     companion object {
         private const val TAG = "StateConfirmation"
         private const val CONFIRMATION_TICKS = 2 // Number of consecutive ticks required
+        private const val UNKNOWN_RESET_TICKS = 3 // Prevent stale "stuck" states
     }
     
     data class ConfirmationResult(
@@ -19,7 +20,8 @@ class StateConfirmation {
     data class PendingState(
         var state: TransferState,
         var consecutiveTicks: Int,
-        var lastConfirmedState: TransferState
+        var lastConfirmedState: TransferState,
+        var unknownTicks: Int
     )
     
     fun processState(transferId: Int, detectedState: TransferState): ConfirmationResult {
@@ -29,21 +31,38 @@ class StateConfirmation {
                 pendingConfirmations[transferId] = PendingState(
                     state = TransferState.OK,
                     consecutiveTicks = 0,
-                    lastConfirmedState = TransferState.OK
+                    lastConfirmedState = TransferState.OK,
+                    unknownTicks = 0
                 )
             }
             
             val pending = pendingConfirmations[transferId]!!
             
-            // Handle UNKNOWN state - do not modify counters
+            // Handle UNKNOWN state with controlled decay to UNKNOWN to avoid stale latching
             if (detectedState == TransferState.UNKNOWN) {
-                Log.d(TAG, "Transfer $transferId: UNKNOWN state detected, ignoring sample")
+                pending.unknownTicks++
+                Log.d(TAG, "Transfer $transferId: UNKNOWN tick ${pending.unknownTicks}/$UNKNOWN_RESET_TICKS")
+
+                if (pending.unknownTicks >= UNKNOWN_RESET_TICKS) {
+                    val changed = pending.lastConfirmedState != TransferState.UNKNOWN
+                    pending.lastConfirmedState = TransferState.UNKNOWN
+                    pending.state = TransferState.UNKNOWN
+                    pending.consecutiveTicks = 0
+                    return ConfirmationResult(
+                        confirmedState = TransferState.UNKNOWN,
+                        pendingTicks = 0,
+                        isStateChanged = changed
+                    )
+                }
+
                 return ConfirmationResult(
                     confirmedState = pending.lastConfirmedState,
                     pendingTicks = pending.consecutiveTicks,
                     isStateChanged = false
                 )
             }
+
+            pending.unknownTicks = 0
             
             // Check if this is the same state as pending
             if (detectedState == pending.state) {
