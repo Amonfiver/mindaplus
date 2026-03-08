@@ -24,6 +24,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         private const val LANE_COHERENCE_MIN_FOR_OK = 0.62f
         private const val MAX_CENTER_NORM_DELTA = 0.35f
         private const val MAX_HEIGHT_NORM_DELTA = 0.20f
+        private const val STRUCTURAL_WEIGHT = 0.55f
+        private const val COLOR_WEIGHT = 0.45f
     }
     
     data class ClassificationResult(
@@ -55,10 +57,18 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         val state: TransferState,
         val sampleCount: Int,
         val bestVisual: Float,
+        val bestStructural: Float,
+        val bestColor: Float,
         val avgTopVisual: Float,
         val bestSpatial: Float,
         val score: Float,
         val scoreLegacyAdjusted: Float
+    )
+
+    private data class VisualSimilarity(
+        val structural: Float,
+        val color: Float,
+        val combined: Float
     )
 
     fun classifyROI(bitmap: Bitmap, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
@@ -113,7 +123,7 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
 
         Log.d(
             TAG,
-            "Transfer $transferId context top=${spatialContext.top} bottom=${spatialContext.bottom} centerY=${"%.1f".format(spatialContext.centerY)} centerYNorm=${"%.4f".format(spatialContext.centerYNorm)} roiHeightNorm=${"%.4f".format(spatialContext.roiHeightNorm)} laneCoherence=${"%.4f".format(laneCoherence)}"
+            "Transfer $transferId context top=${spatialContext.top} bottom=${spatialContext.bottom} centerY=${"%.1f".format(spatialContext.centerY)} centerYNorm=${"%.4f".format(spatialContext.centerYNorm)} roiHeightNorm=${"%.4f".format(spatialContext.roiHeightNorm)} laneCoherence=${"%.4f".format(laneCoherence)} visualMode=color_aware(structural+lchroma)"
         )
 
         val enabledStates = MonitoringMode.enabledTrainingStates
@@ -133,15 +143,17 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                     calculateSpatialSimilarity(spatialContext, it)
                 }
                 val combined = if (spatialSimilarity != null) {
-                    (visualSimilarity * VISUAL_WEIGHT) + (spatialSimilarity * SPATIAL_WEIGHT)
+                    (visualSimilarity.combined * VISUAL_WEIGHT) + (spatialSimilarity * SPATIAL_WEIGHT)
                 } else {
-                    visualSimilarity * LEGACY_NO_SPATIAL_PENALTY
+                    visualSimilarity.combined * LEGACY_NO_SPATIAL_PENALTY
                 }
                 Triple(visualSimilarity, spatialSimilarity, combined)
             }
 
-            val bestVisual = perSampleScores.maxOfOrNull { it.first } ?: 0f
-            val avgTopVisual = perSampleScores.map { it.first }.sortedDescending().take(2).average().toFloat()
+            val bestVisual = perSampleScores.maxOfOrNull { it.first.combined } ?: 0f
+            val bestStructural = perSampleScores.maxOfOrNull { it.first.structural } ?: 0f
+            val bestColor = perSampleScores.maxOfOrNull { it.first.color } ?: 0f
+            val avgTopVisual = perSampleScores.map { it.first.combined }.sortedDescending().take(2).average().toFloat()
             val bestSpatial = perSampleScores.mapNotNull { it.second }.maxOrNull() ?: 0f
 
             val top2Combined = perSampleScores.map { it.third }.sortedDescending().take(2)
@@ -155,6 +167,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 state = state,
                 sampleCount = samples.size,
                 bestVisual = bestVisual,
+                bestStructural = bestStructural,
+                bestColor = bestColor,
                 avgTopVisual = avgTopVisual,
                 bestSpatial = bestSpatial,
                 score = score,
@@ -163,7 +177,7 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
 
             Log.d(
                 TAG,
-                "Transfer $transferId state=$state samples=${samples.size} withSpatial=$withSpatialCount bestVisual=${"%.4f".format(bestVisual)} avgTopVisual=${"%.4f".format(avgTopVisual)} bestSpatial=${"%.4f".format(bestSpatial)} score=${"%.4f".format(score)} laneAdj=${"%.4f".format(laneAdjusted)}"
+                "Transfer $transferId state=$state samples=${samples.size} withSpatial=$withSpatialCount bestVisual=${"%.4f".format(bestVisual)} bestStructural=${"%.4f".format(bestStructural)} bestColor=${"%.4f".format(bestColor)} avgTopVisual=${"%.4f".format(avgTopVisual)} bestSpatial=${"%.4f".format(bestSpatial)} score=${"%.4f".format(score)} laneAdj=${"%.4f".format(laneAdjusted)}"
             )
         }
 
@@ -223,15 +237,15 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         return ClassificationResult(best.state, best.scoreLegacyAdjusted, true)
     }
 
-    private fun calculateVisualSimilarityWithTemplateFallback(currentRoi: Bitmap, templateBitmap: Bitmap): Float {
-        val asIs = calculateSimilarity(currentRoi, templateBitmap)
+    private fun calculateVisualSimilarityWithTemplateFallback(currentRoi: Bitmap, templateBitmap: Bitmap): VisualSimilarity {
+        val asIs = calculateVisualSimilarity(currentRoi, templateBitmap)
         val focusedTemplate = if (MonitoringMode.focusedSubRoiEnabled) {
             focusRoi(templateBitmap, "template", logDetails = false)
         } else {
             null
         }
-        val focusedScore = focusedTemplate?.let { calculateSimilarity(currentRoi, it) } ?: asIs
-        return max(asIs, focusedScore)
+        val focusedScore = focusedTemplate?.let { calculateVisualSimilarity(currentRoi, it) } ?: asIs
+        return if (focusedScore.combined >= asIs.combined) focusedScore else asIs
     }
 
     private fun computeTransferLaneCoherence(context: SpatialContext): Float {
@@ -288,15 +302,35 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 return null
             }
             
-            // Create grayscale bitmap from Y plane
+            // Create color bitmap from YUV planes
             val bitmap = Bitmap.createBitmap(roiWidth, roiHeight, Bitmap.Config.ARGB_8888)
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+            val yPixelStride = yPlane.pixelStride
+            val uPixelStride = uPlane.pixelStride
+            val vPixelStride = vPlane.pixelStride
+            val uRowStride = uPlane.rowStride
+            val vRowStride = vPlane.rowStride
             
             for (y in top until bottom) {
                 val rowStart = y * yRowStride
                 for (x in left until right) {
-                    val yValue = yBuffer.get(rowStart + x).toInt() and 0xFF
-                    val gray = yValue or (yValue shl 8) or (yValue shl 16) or (0xFF shl 24)
-                    bitmap.setPixel(x - left, y - top, gray)
+                    val yValue = yBuffer.get(rowStart + (x * yPixelStride)).toInt() and 0xFF
+                    val uvX = x / 2
+                    val uvY = y / 2
+                    val uValue = uBuffer.get(uvY * uRowStride + uvX * uPixelStride).toInt() and 0xFF
+                    val vValue = vBuffer.get(uvY * vRowStride + uvX * vPixelStride).toInt() and 0xFF
+
+                    val c = (yValue - 16).coerceAtLeast(0)
+                    val d = uValue - 128
+                    val e = vValue - 128
+                    val r = ((298 * c + 409 * e + 128) shr 8).coerceIn(0, 255)
+                    val g = ((298 * c - 100 * d - 208 * e + 128) shr 8).coerceIn(0, 255)
+                    val b = ((298 * c + 516 * d + 128) shr 8).coerceIn(0, 255)
+                    val rgb = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                    bitmap.setPixel(x - left, y - top, rgb)
                 }
             }
             
@@ -328,21 +362,7 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 return null
             }
 
-            // Create grayscale bitmap for consistent template matching
-            val roiBitmap = Bitmap.createBitmap(roiWidth, roiHeight, Bitmap.Config.ARGB_8888)
-
-            for (y in top until bottom) {
-                for (x in left until right) {
-                    val pixel = bitmap.getPixel(x, y)
-                    val r = (pixel shr 16) and 0xFF
-                    val g = (pixel shr 8) and 0xFF
-                    val b = pixel and 0xFF
-                    val gray = (0.299 * r + 0.587 * g + 0.114 * b).toInt().coerceIn(0, 255)
-                    val grayPixel = gray or (gray shl 8) or (gray shl 16) or (0xFF shl 24)
-                    roiBitmap.setPixel(x - left, y - top, grayPixel)
-                }
-            }
-
+            val roiBitmap = Bitmap.createBitmap(bitmap, left, top, roiWidth, roiHeight)
             val focused = focusRoi(roiBitmap, "current_bitmap", logDetails = true)
             return Bitmap.createScaledBitmap(focused, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
 
@@ -352,17 +372,18 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         }
     }
     
-    private fun calculateSimilarity(bitmap1: Bitmap, bitmap2: Bitmap): Float {
+    private fun calculateVisualSimilarity(bitmap1: Bitmap, bitmap2: Bitmap): VisualSimilarity {
         try {
             if (bitmap1.width != bitmap2.width || bitmap1.height != bitmap2.height) {
                 Log.w(TAG, "Bitmap dimensions mismatch: ${bitmap1.width}x${bitmap1.height} vs ${bitmap2.width}x${bitmap2.height}")
-                return 0f
+                return VisualSimilarity(0f, 0f, 0f)
             }
             
             val width = bitmap1.width
             val height = bitmap1.height
             
-            var totalDifference = 0L
+            var structuralDiffSum = 0f
+            var colorDiffSum = 0f
             var pixelCount = 0
             
             // Sample every 4th pixel for performance
@@ -370,31 +391,53 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 for (x in 0 until width step 4) {
                     val pixel1 = bitmap1.getPixel(x, y)
                     val pixel2 = bitmap2.getPixel(x, y)
-                    
-                    // Extract grayscale values
-                    val gray1 = pixel1 and 0xFF
-                    val gray2 = pixel2 and 0xFF
-                    
-                    totalDifference += abs(gray1 - gray2)
+
+                    val r1 = ((pixel1 shr 16) and 0xFF).toFloat()
+                    val g1 = ((pixel1 shr 8) and 0xFF).toFloat()
+                    val b1 = (pixel1 and 0xFF).toFloat()
+                    val r2 = ((pixel2 shr 16) and 0xFF).toFloat()
+                    val g2 = ((pixel2 shr 8) and 0xFF).toFloat()
+                    val b2 = (pixel2 and 0xFF).toFloat()
+
+                    val lum1 = (0.299f * r1) + (0.587f * g1) + (0.114f * b1)
+                    val lum2 = (0.299f * r2) + (0.587f * g2) + (0.114f * b2)
+                    structuralDiffSum += abs(lum1 - lum2) / 255f
+
+                    val sum1 = (r1 + g1 + b1).coerceAtLeast(1f)
+                    val sum2 = (r2 + g2 + b2).coerceAtLeast(1f)
+                    val nr1 = r1 / sum1
+                    val ng1 = g1 / sum1
+                    val nb1 = b1 / sum1
+                    val nr2 = r2 / sum2
+                    val ng2 = g2 / sum2
+                    val nb2 = b2 / sum2
+                    val chromaDiff = (abs(nr1 - nr2) + abs(ng1 - ng2) + abs(nb1 - nb2)) / 3f
+
+                    val sat1 = ((max(r1, max(g1, b1)) - min(r1, min(g1, b1))) / max(r1, max(g1, b1)).coerceAtLeast(1f))
+                    val sat2 = ((max(r2, max(g2, b2)) - min(r2, min(g2, b2))) / max(r2, max(g2, b2)).coerceAtLeast(1f))
+                    val saturationDiff = abs(sat1 - sat2)
+
+                    colorDiffSum += ((chromaDiff * 0.8f) + (saturationDiff * 0.2f)).coerceIn(0f, 1f)
                     pixelCount++
                 }
             }
             
             if (pixelCount == 0) {
-                return 0f
+                return VisualSimilarity(0f, 0f, 0f)
             }
-            
-            val avgDifference = totalDifference.toFloat() / pixelCount.toFloat()
-            val maxPossibleDifference = 255f
-            
-            // Convert difference to similarity (0.0 to 1.0)
-            val similarity = 1.0f - (avgDifference / maxPossibleDifference)
-            
-            return kotlin.math.max(0.0f, kotlin.math.min(1.0f, similarity))
+
+            val structuralSimilarity = (1f - (structuralDiffSum / pixelCount.toFloat())).coerceIn(0f, 1f)
+            val colorSimilarity = (1f - (colorDiffSum / pixelCount.toFloat())).coerceIn(0f, 1f)
+            val combined = ((structuralSimilarity * STRUCTURAL_WEIGHT) + (colorSimilarity * COLOR_WEIGHT)).coerceIn(0f, 1f)
+            return VisualSimilarity(
+                structural = structuralSimilarity,
+                color = colorSimilarity,
+                combined = combined
+            )
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error calculating similarity", e)
-            return 0f
+            Log.e(TAG, "Error calculating color-aware similarity", e)
+            return VisualSimilarity(0f, 0f, 0f)
         }
     }
 
