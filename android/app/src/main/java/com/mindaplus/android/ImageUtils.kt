@@ -7,9 +7,18 @@ import android.util.Log
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.ExperimentalGetImage
 import java.nio.ByteBuffer
+import kotlin.math.min
 
 object ImageUtils {
     private const val TAG = "ImageUtils"
+
+    data class FitDisplayMapping(
+        val scale: Float,
+        val offsetX: Float,
+        val offsetY: Float,
+        val drawnWidth: Float,
+        val drawnHeight: Float
+    )
     
     /**
      * Convierte un ImageProxy a Bitmap de forma segura antes de que se cierre.
@@ -184,5 +193,35 @@ object ImageUtils {
             Log.e(TAG, "Error creating centered crop", e)
             null
         }
+    }
+
+    /**
+     * Mapeo para mostrar bitmap en una vista usando comportamiento equivalente a ContentScale.Fit.
+     */
+    fun computeFitDisplayMapping(
+        viewWidth: Int,
+        viewHeight: Int,
+        bitmapWidth: Int,
+        bitmapHeight: Int
+    ): FitDisplayMapping {
+        val safeViewW = viewWidth.coerceAtLeast(1)
+        val safeViewH = viewHeight.coerceAtLeast(1)
+        val safeBmpW = bitmapWidth.coerceAtLeast(1)
+        val safeBmpH = bitmapHeight.coerceAtLeast(1)
+
+        val scaleX = safeViewW.toFloat() / safeBmpW.toFloat()
+        val scaleY = safeViewH.toFloat() / safeBmpH.toFloat()
+        val scale = min(scaleX, scaleY)
+        val drawnW = safeBmpW * scale
+        val drawnH = safeBmpH * scale
+        val offsetX = (safeViewW - drawnW) / 2f
+        val offsetY = (safeViewH - drawnH) / 2f
+        return FitDisplayMapping(
+            scale = scale,
+            offsetX = offsetX,
+            offsetY = offsetY,
+            drawnWidth = drawnW,
+            drawnHeight = drawnH
+        )
     }
 }

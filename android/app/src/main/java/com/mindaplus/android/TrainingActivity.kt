@@ -299,7 +299,7 @@ class TrainingActivity : ComponentActivity() {
                                         bitmap = laneBmp.asImageBitmap(),
                                         contentDescription = "Lane calibration",
                                         modifier = Modifier.fillMaxSize(),
-                                        contentScale = ContentScale.FillBounds
+                                        contentScale = ContentScale.Fit
                                     )
                                     Canvas(
                                         modifier = Modifier
@@ -317,6 +317,20 @@ class TrainingActivity : ComponentActivity() {
                                                 )
                                             }
                                     ) {
+                                        val mapping = ImageUtils.computeFitDisplayMapping(
+                                            viewWidth = size.width.toInt(),
+                                            viewHeight = size.height.toInt(),
+                                            bitmapWidth = laneBmp.width,
+                                            bitmapHeight = laneBmp.height
+                                        )
+
+                                        drawRect(
+                                            color = Color.White.copy(alpha = 0.08f),
+                                            topLeft = Offset(mapping.offsetX, mapping.offsetY),
+                                            size = Size(mapping.drawnWidth, mapping.drawnHeight),
+                                            style = Stroke(width = 1f)
+                                        )
+
                                         val start = calibrationStart
                                         val end = calibrationEnd
                                         if (start != null && end != null) {
@@ -774,6 +788,10 @@ class TrainingActivity : ComponentActivity() {
             showMessage("Error al recortar lane de calibración")
             return
         }
+        Log.d(
+            TAG,
+            "Calibration lane capture frame=${bitmap.width}x${bitmap.height} laneRegion=(${lane.left},${lane.top})-(${lane.right},${lane.bottom}) laneBitmap=${laneBitmap.width}x${laneBitmap.height}"
+        )
         calibrationLaneBitmap = laneBitmap
         calibrationStart = null
         calibrationEnd = null
@@ -786,17 +804,37 @@ class TrainingActivity : ComponentActivity() {
         val end = calibrationEnd ?: return
         if (laneBitmap.width <= 0 || laneBitmap.height <= 0) return
 
-        val canvasWidth = calibrationCanvasSize.width.toFloat().coerceAtLeast(1f)
-        val canvasHeight = calibrationCanvasSize.height.toFloat().coerceAtLeast(1f)
-        val leftNorm = (min(start.x, end.x) / canvasWidth).coerceIn(0f, 1f)
-        val topNorm = (min(start.y, end.y) / canvasHeight).coerceIn(0f, 1f)
-        val rightNorm = (max(start.x, end.x) / canvasWidth).coerceIn(0f, 1f)
-        val bottomNorm = (max(start.y, end.y) / canvasHeight).coerceIn(0f, 1f)
+        val mapping = ImageUtils.computeFitDisplayMapping(
+            viewWidth = calibrationCanvasSize.width,
+            viewHeight = calibrationCanvasSize.height,
+            bitmapWidth = laneBitmap.width,
+            bitmapHeight = laneBitmap.height
+        )
+
+        val viewLeft = min(start.x, end.x)
+        val viewTop = min(start.y, end.y)
+        val viewRight = max(start.x, end.x)
+        val viewBottom = max(start.y, end.y)
+
+        val bmpLeft = ((viewLeft - mapping.offsetX) / mapping.scale).coerceIn(0f, laneBitmap.width.toFloat())
+        val bmpTop = ((viewTop - mapping.offsetY) / mapping.scale).coerceIn(0f, laneBitmap.height.toFloat())
+        val bmpRight = ((viewRight - mapping.offsetX) / mapping.scale).coerceIn(0f, laneBitmap.width.toFloat())
+        val bmpBottom = ((viewBottom - mapping.offsetY) / mapping.scale).coerceIn(0f, laneBitmap.height.toFloat())
+
+        val leftNorm = (bmpLeft / laneBitmap.width.toFloat()).coerceIn(0f, 1f)
+        val topNorm = (bmpTop / laneBitmap.height.toFloat()).coerceIn(0f, 1f)
+        val rightNorm = (bmpRight / laneBitmap.width.toFloat()).coerceIn(0f, 1f)
+        val bottomNorm = (bmpBottom / laneBitmap.height.toFloat()).coerceIn(0f, 1f)
 
         if (rightNorm - leftNorm < 0.03f || bottomNorm - topNorm < 0.03f) {
             showMessage("ROI demasiado pequeña")
             return
         }
+
+        Log.d(
+            TAG,
+            "ROI calibration geometry laneBmp=${laneBitmap.width}x${laneBitmap.height} view=${calibrationCanvasSize.width}x${calibrationCanvasSize.height} scaleMode=Fit scale=${"%.4f".format(mapping.scale)} offset=(${String.format("%.2f", mapping.offsetX)},${String.format("%.2f", mapping.offsetY)}) viewRoi=(${String.format("%.1f", viewLeft)},${String.format("%.1f", viewTop)})-(${String.format("%.1f", viewRight)},${String.format("%.1f", viewBottom)}) bmpRoi=(${String.format("%.1f", bmpLeft)},${String.format("%.1f", bmpTop)})-(${String.format("%.1f", bmpRight)},${String.format("%.1f", bmpBottom)}) normRoi=(${String.format("%.4f", leftNorm)},${String.format("%.4f", topNorm)})-(${String.format("%.4f", rightNorm)},${String.format("%.4f", bottomNorm)})"
+        )
 
         val roi = TemplateStorage.ManualRoi(
             leftNorm = leftNorm,
@@ -821,6 +859,10 @@ class TrainingActivity : ComponentActivity() {
         val top = (roi.topNorm * laneBitmap.height).toInt().coerceIn(0, laneBitmap.height - 1)
         val right = (roi.rightNorm * laneBitmap.width).toInt().coerceIn(left + 1, laneBitmap.width)
         val bottom = (roi.bottomNorm * laneBitmap.height).toInt().coerceIn(top + 1, laneBitmap.height)
+        Log.d(
+            TAG,
+            "Applying manual ROI lane=${laneBitmap.width}x${laneBitmap.height} norm=(${String.format("%.4f", roi.leftNorm)},${String.format("%.4f", roi.topNorm)})-(${String.format("%.4f", roi.rightNorm)},${String.format("%.4f", roi.bottomNorm)}) px=($left,$top)-($right,$bottom)"
+        )
         return ImageUtils.cropBitmap(laneBitmap, left, top, right, bottom)
     }
 
