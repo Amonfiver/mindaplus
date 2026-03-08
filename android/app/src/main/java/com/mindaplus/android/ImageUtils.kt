@@ -160,4 +160,29 @@ object ImageUtils {
             null
         }
     }
+
+    /**
+     * Recorta una sub-ROI centrada por ratios (0..1). Si el recorte no es válido, devuelve null.
+     */
+    fun cropCenteredByRatio(bitmap: Bitmap, widthRatio: Float, heightRatio: Float): Bitmap? {
+        return try {
+            if (bitmap.width <= 1 || bitmap.height <= 1) return null
+
+            val safeWidthRatio = widthRatio.coerceIn(0.1f, 1f)
+            val safeHeightRatio = heightRatio.coerceIn(0.1f, 1f)
+
+            val targetWidth = (bitmap.width * safeWidthRatio).toInt().coerceIn(1, bitmap.width)
+            val targetHeight = (bitmap.height * safeHeightRatio).toInt().coerceIn(1, bitmap.height)
+
+            val left = ((bitmap.width - targetWidth) / 2).coerceIn(0, bitmap.width - 1)
+            val top = ((bitmap.height - targetHeight) / 2).coerceIn(0, bitmap.height - 1)
+            val right = (left + targetWidth).coerceIn(left + 1, bitmap.width)
+            val bottom = (top + targetHeight).coerceIn(top + 1, bitmap.height)
+
+            Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating centered crop", e)
+            null
+        }
+    }
 }

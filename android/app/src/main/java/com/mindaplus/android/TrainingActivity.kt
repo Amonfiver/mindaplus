@@ -495,23 +495,36 @@ class TrainingActivity : ComponentActivity() {
                 Log.d(TAG, "Selected lane $targetLaneIndex for T$selectedTransfer: $targetLane")
                 
                 // Step 3: Crop bitmap to the detected lane region
-                val croppedBitmap = ImageUtils.cropBitmap(bitmap, targetLane.left, targetLane.top, targetLane.right, targetLane.bottom)
-                if (croppedBitmap == null) {
+                val laneBitmap = ImageUtils.cropBitmap(bitmap, targetLane.left, targetLane.top, targetLane.right, targetLane.bottom)
+                if (laneBitmap == null) {
                     Log.e(TAG, "Failed to crop bitmap to lane region")
                     showMessage("Error al recortar la región")
                     isCapturing = false
                     return@launch
                 }
+
+                val focusedBitmap = if (MonitoringMode.focusedSubRoiEnabled) {
+                    ImageUtils.cropCenteredByRatio(
+                        laneBitmap,
+                        MonitoringMode.focusedSubRoiWidthRatio,
+                        MonitoringMode.focusedSubRoiHeightRatio
+                    ) ?: laneBitmap
+                } else {
+                    laneBitmap
+                }
                 
-                Log.d(TAG, "Successfully cropped bitmap to ${croppedBitmap.width}x${croppedBitmap.height}")
+                Log.d(
+                    TAG,
+                    "Template capture ROI strategy=${if (MonitoringMode.focusedSubRoiEnabled) "center_crop" else "full_lane"} laneRoi=${laneBitmap.width}x${laneBitmap.height} subRoi=${focusedBitmap.width}x${focusedBitmap.height} ratios=${MonitoringMode.focusedSubRoiWidthRatio}x${MonitoringMode.focusedSubRoiHeightRatio}"
+                )
                 
                 // Step 4: Store the cropped template for preview (NO guardar todavía)
                 // Update UI with preview and region info
-                capturedTemplatePreview = croppedBitmap
+                capturedTemplatePreview = focusedBitmap
                 detectedLaneRegion = targetLane
                 lastCapturedTransfer = selectedTransfer
                 lastCapturedState = selectedState
-                pendingTemplateBitmap = croppedBitmap // Guardar para cuando se pulse "Guardar"
+                pendingTemplateBitmap = focusedBitmap // Guardar para cuando se pulse "Guardar"
                 pendingFrameWidth = bitmap.width
                 pendingFrameHeight = bitmap.height
                 

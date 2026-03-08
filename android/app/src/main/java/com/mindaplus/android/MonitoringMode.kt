@@ -22,6 +22,11 @@ object MonitoringMode {
         setOf(TransferState.OBSTACULO, TransferState.FALLO)
     }
 
+    // Focus strategy for template visual matching in temporal mode.
+    val focusedSubRoiEnabled: Boolean = singleLaneTestMode
+    const val focusedSubRoiWidthRatio: Float = 0.52f
+    const val focusedSubRoiHeightRatio: Float = 0.72f
+
     fun isTransferEnabled(transferId: Int): Boolean = transferId in enabledTransfers
     fun isStateEnabled(state: TransferState): Boolean = state in enabledTrainingStates
 }

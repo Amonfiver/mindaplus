@@ -127,7 +127,7 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
 
             var withSpatialCount = 0
             val perSampleScores = samples.map { sample ->
-                val visualSimilarity = calculateSimilarity(currentROI, sample.bitmap)
+                val visualSimilarity = calculateVisualSimilarityWithTemplateFallback(currentROI, sample.bitmap)
                 val spatialSimilarity = sample.spatialMetadata?.let {
                     withSpatialCount += 1
                     calculateSpatialSimilarity(spatialContext, it)
@@ -223,6 +223,17 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         return ClassificationResult(best.state, best.scoreLegacyAdjusted, true)
     }
 
+    private fun calculateVisualSimilarityWithTemplateFallback(currentRoi: Bitmap, templateBitmap: Bitmap): Float {
+        val asIs = calculateSimilarity(currentRoi, templateBitmap)
+        val focusedTemplate = if (MonitoringMode.focusedSubRoiEnabled) {
+            focusRoi(templateBitmap, "template", logDetails = false)
+        } else {
+            null
+        }
+        val focusedScore = focusedTemplate?.let { calculateSimilarity(currentRoi, it) } ?: asIs
+        return max(asIs, focusedScore)
+    }
+
     private fun computeTransferLaneCoherence(context: SpatialContext): Float {
         val expectedCenterNorm = when (context.transferId) {
             100 -> 1f / 6f
@@ -289,8 +300,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 }
             }
             
-            // Resize to template size
-            return Bitmap.createScaledBitmap(bitmap, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
+            val focused = focusRoi(bitmap, "current_yuv", logDetails = true)
+            return Bitmap.createScaledBitmap(focused, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
             
         } catch (e: Exception) {
             Log.e(TAG, "Error extracting ROI", e)
@@ -332,8 +343,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 }
             }
 
-            // Resize to template size
-            return Bitmap.createScaledBitmap(roiBitmap, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
+            val focused = focusRoi(roiBitmap, "current_bitmap", logDetails = true)
+            return Bitmap.createScaledBitmap(focused, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
 
         } catch (e: Exception) {
             Log.e(TAG, "Error extracting ROI from bitmap", e)
@@ -385,5 +396,35 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
             Log.e(TAG, "Error calculating similarity", e)
             return 0f
         }
+    }
+
+    private fun focusRoi(input: Bitmap, source: String, logDetails: Boolean): Bitmap {
+        if (!MonitoringMode.focusedSubRoiEnabled) {
+            return input
+        }
+
+        val focused = ImageUtils.cropCenteredByRatio(
+            input,
+            MonitoringMode.focusedSubRoiWidthRatio,
+            MonitoringMode.focusedSubRoiHeightRatio
+        )
+
+        if (focused == null) {
+            if (logDetails) {
+                Log.w(
+                    TAG,
+                    "ROI focus fallback source=$source strategy=center_crop laneRoi=${input.width}x${input.height} (invalid subROI)"
+                )
+            }
+            return input
+        }
+
+        if (logDetails) {
+            Log.d(
+                TAG,
+                "ROI focus source=$source strategy=center_crop laneRoi=${input.width}x${input.height} subRoi=${focused.width}x${focused.height} ratios=${MonitoringMode.focusedSubRoiWidthRatio}x${MonitoringMode.focusedSubRoiHeightRatio}"
+            )
+        }
+        return focused
     }
 }
