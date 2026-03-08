@@ -13,14 +13,52 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         private const val TAG = "TemplateClassifier"
         private const val TEMPLATE_WIDTH = 128
         private const val TEMPLATE_HEIGHT = 64
-        private const val SIMILARITY_THRESHOLD = 0.72f
+        private const val SIMILARITY_THRESHOLD = 0.70f
         private const val AMBIGUITY_MARGIN = 0.035f
+        private const val VISUAL_WEIGHT = 0.78f
+        private const val SPATIAL_WEIGHT = 0.22f
+        private const val LEGACY_NO_SPATIAL_PENALTY = 0.97f
+        private const val ALERT_MATCH_THRESHOLD = 0.74f
+        private const val ALERT_OVER_OK_MARGIN = 0.02f
+        private const val OK_BASELINE_MIN = 0.58f
+        private const val LANE_COHERENCE_MIN_FOR_OK = 0.62f
+        private const val MAX_CENTER_NORM_DELTA = 0.35f
+        private const val MAX_HEIGHT_NORM_DELTA = 0.20f
     }
     
     data class ClassificationResult(
         val state: TransferState,
         val similarity: Float,
         val isConfident: Boolean
+    )
+
+    private data class SpatialContext(
+        val transferId: Int,
+        val top: Int,
+        val bottom: Int,
+        val frameHeight: Int
+    ) {
+        val centerY: Float
+            get() = (top + bottom) / 2f
+
+        val roiHeight: Int
+            get() = (bottom - top).coerceAtLeast(1)
+
+        val centerYNorm: Float
+            get() = if (frameHeight > 0) centerY / frameHeight.toFloat() else 0f
+
+        val roiHeightNorm: Float
+            get() = if (frameHeight > 0) roiHeight / frameHeight.toFloat() else 0f
+    }
+
+    private data class CandidateScore(
+        val state: TransferState,
+        val sampleCount: Int,
+        val bestVisual: Float,
+        val avgTopVisual: Float,
+        val bestSpatial: Float,
+        val score: Float,
+        val scoreLegacyAdjusted: Float
     )
 
     fun classifyROI(bitmap: Bitmap, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
@@ -31,7 +69,13 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 Log.w(TAG, "Failed to extract ROI for transfer $transferId")
                 return ClassificationResult(TransferState.UNKNOWN, 0f, false)
             }
-            return classifyFromRoi(currentROI, transferId)
+            val spatialContext = SpatialContext(
+                transferId = transferId,
+                top = roi.top,
+                bottom = roi.bottom,
+                frameHeight = bitmap.height
+            )
+            return classifyFromRoi(currentROI, spatialContext)
 
         } catch (e: Exception) {
             Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
@@ -47,7 +91,13 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 Log.w(TAG, "Failed to extract ROI for transfer $transferId")
                 return ClassificationResult(TransferState.UNKNOWN, 0f, false)
             }
-            return classifyFromRoi(currentROI, transferId)
+            val spatialContext = SpatialContext(
+                transferId = transferId,
+                top = roi.top,
+                bottom = roi.bottom,
+                frameHeight = imageHeight
+            )
+            return classifyFromRoi(currentROI, spatialContext)
             
         } catch (e: Exception) {
             Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
@@ -55,55 +105,151 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         }
     }
 
-    private fun classifyFromRoi(currentROI: Bitmap, transferId: Int): ClassificationResult {
-        val classScores = mutableMapOf<TransferState, Float>()
+    private fun classifyFromRoi(currentROI: Bitmap, spatialContext: SpatialContext): ClassificationResult {
+        val transferId = spatialContext.transferId
+        val candidates = mutableListOf<CandidateScore>()
         val classSampleCounts = mutableMapOf<TransferState, Int>()
+        val laneCoherence = computeTransferLaneCoherence(spatialContext)
+
+        Log.d(
+            TAG,
+            "Transfer $transferId context top=${spatialContext.top} bottom=${spatialContext.bottom} centerY=${"%.1f".format(spatialContext.centerY)} centerYNorm=${"%.4f".format(spatialContext.centerYNorm)} roiHeightNorm=${"%.4f".format(spatialContext.roiHeightNorm)} laneCoherence=${"%.4f".format(laneCoherence)}"
+        )
 
         for (state in listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)) {
-            val templates = templateStorage.loadTemplates(transferId, state)
-            classSampleCounts[state] = templates.size
+            val samples = templateStorage.loadTemplateSamples(transferId, state)
+            classSampleCounts[state] = samples.size
 
-            if (templates.isEmpty()) {
+            if (samples.isEmpty()) {
                 continue
             }
 
-            val similarities = templates.map { template -> calculateSimilarity(currentROI, template) }
-            val bestSimilarity = similarities.maxOrNull() ?: 0f
-            val top2 = similarities.sortedDescending().take(2)
-            val avgTop = top2.average().toFloat()
-            val classScore = (bestSimilarity * 0.7f) + (avgTop * 0.3f)
+            var withSpatialCount = 0
+            val perSampleScores = samples.map { sample ->
+                val visualSimilarity = calculateSimilarity(currentROI, sample.bitmap)
+                val spatialSimilarity = sample.spatialMetadata?.let {
+                    withSpatialCount += 1
+                    calculateSpatialSimilarity(spatialContext, it)
+                }
+                val combined = if (spatialSimilarity != null) {
+                    (visualSimilarity * VISUAL_WEIGHT) + (spatialSimilarity * SPATIAL_WEIGHT)
+                } else {
+                    visualSimilarity * LEGACY_NO_SPATIAL_PENALTY
+                }
+                Triple(visualSimilarity, spatialSimilarity, combined)
+            }
 
-            classScores[state] = classScore
+            val bestVisual = perSampleScores.maxOfOrNull { it.first } ?: 0f
+            val avgTopVisual = perSampleScores.map { it.first }.sortedDescending().take(2).average().toFloat()
+            val bestSpatial = perSampleScores.mapNotNull { it.second }.maxOrNull() ?: 0f
+
+            val top2Combined = perSampleScores.map { it.third }.sortedDescending().take(2)
+            val avgTopCombined = top2Combined.average().toFloat()
+            val bestCombined = top2Combined.firstOrNull() ?: 0f
+            val score = (bestCombined * 0.7f) + (avgTopCombined * 0.3f)
+
+            val laneAdjusted = applyLaneCoherence(score, laneCoherence, state)
+
+            candidates += CandidateScore(
+                state = state,
+                sampleCount = samples.size,
+                bestVisual = bestVisual,
+                avgTopVisual = avgTopVisual,
+                bestSpatial = bestSpatial,
+                score = score,
+                scoreLegacyAdjusted = laneAdjusted
+            )
+
             Log.d(
                 TAG,
-                "Transfer $transferId state=$state samples=${templates.size} best=${"%.4f".format(bestSimilarity)} avgTop=${"%.4f".format(avgTop)} score=${"%.4f".format(classScore)}"
+                "Transfer $transferId state=$state samples=${samples.size} withSpatial=$withSpatialCount bestVisual=${"%.4f".format(bestVisual)} avgTopVisual=${"%.4f".format(avgTopVisual)} bestSpatial=${"%.4f".format(bestSpatial)} score=${"%.4f".format(score)} laneAdj=${"%.4f".format(laneAdjusted)}"
             )
         }
 
-        if (classScores.isEmpty()) {
+        if (candidates.isEmpty()) {
             Log.w(TAG, "No templates found for transfer $transferId (all classes empty)")
             return ClassificationResult(TransferState.UNKNOWN, 0f, false)
         }
 
-        val ranked = classScores.entries.sortedByDescending { it.value }
+        val ranked = candidates.sortedByDescending { it.scoreLegacyAdjusted }
         val best = ranked[0]
         val second = ranked.getOrNull(1)
-        val margin = if (second != null) best.value - second.value else best.value
-        val isConfident = best.value >= SIMILARITY_THRESHOLD && margin >= AMBIGUITY_MARGIN
+        val margin = if (second != null) best.scoreLegacyAdjusted - second.scoreLegacyAdjusted else best.scoreLegacyAdjusted
 
+        val okCandidate = candidates.firstOrNull { it.state == TransferState.OK }
+        val obstacleCandidate = candidates.firstOrNull { it.state == TransferState.OBSTACULO }
+        val falloCandidate = candidates.firstOrNull { it.state == TransferState.FALLO }
+        val bestAlert = listOfNotNull(obstacleCandidate, falloCandidate).maxByOrNull { it.scoreLegacyAdjusted }
+
+        if (bestAlert != null) {
+            val okScore = okCandidate?.scoreLegacyAdjusted ?: 0f
+            val alertOverOk = bestAlert.scoreLegacyAdjusted - okScore
+            val alertStrong = bestAlert.scoreLegacyAdjusted >= ALERT_MATCH_THRESHOLD
+            if (alertStrong && alertOverOk >= ALERT_OVER_OK_MARGIN && margin >= AMBIGUITY_MARGIN) {
+                Log.d(
+                    TAG,
+                    "Transfer $transferId decision=${bestAlert.state} reason=strong_alert score=${"%.4f".format(bestAlert.scoreLegacyAdjusted)} overOk=${"%.4f".format(alertOverOk)} margin=${"%.4f".format(margin)}"
+                )
+                return ClassificationResult(bestAlert.state, bestAlert.scoreLegacyAdjusted, true)
+            }
+        }
+
+        if (okCandidate != null && laneCoherence >= LANE_COHERENCE_MIN_FOR_OK) {
+            val bestAlertScore = bestAlert?.scoreLegacyAdjusted ?: 0f
+            val noStrongAlert = bestAlertScore < ALERT_MATCH_THRESHOLD
+            val okByDiscardScore = max(okCandidate.scoreLegacyAdjusted, (okCandidate.score * 0.75f) + (laneCoherence * 0.25f))
+            if (noStrongAlert && okByDiscardScore >= OK_BASELINE_MIN) {
+                Log.d(
+                    TAG,
+                    "Transfer $transferId decision=OK reason=baseline_discard okScore=${"%.4f".format(okCandidate.scoreLegacyAdjusted)} okDiscard=${"%.4f".format(okByDiscardScore)} bestAlert=${"%.4f".format(bestAlertScore)} laneCoherence=${"%.4f".format(laneCoherence)}"
+                )
+                return ClassificationResult(TransferState.OK, okByDiscardScore, true)
+            }
+        }
+
+        val isConfident = best.scoreLegacyAdjusted >= SIMILARITY_THRESHOLD && margin >= AMBIGUITY_MARGIN
         if (!isConfident) {
             Log.w(
                 TAG,
-                "Transfer $transferId ambiguous/low confidence. best=${best.key}:${"%.4f".format(best.value)} second=${second?.key}:${"%.4f".format(second?.value ?: 0f)} margin=${"%.4f".format(margin)} samples=$classSampleCounts"
+                "Transfer $transferId ambiguous/low confidence. best=${best.state}:${"%.4f".format(best.scoreLegacyAdjusted)} second=${second?.state}:${"%.4f".format(second?.scoreLegacyAdjusted ?: 0f)} margin=${"%.4f".format(margin)} laneCoherence=${"%.4f".format(laneCoherence)} samples=$classSampleCounts reason=unknown_ambiguity"
             )
-            return ClassificationResult(TransferState.UNKNOWN, best.value, false)
+            return ClassificationResult(TransferState.UNKNOWN, best.scoreLegacyAdjusted, false)
         }
 
         Log.d(
             TAG,
-            "Transfer $transferId classified=${best.key} score=${"%.4f".format(best.value)} margin=${"%.4f".format(margin)} samples=$classSampleCounts"
+            "Transfer $transferId classified=${best.state} score=${"%.4f".format(best.scoreLegacyAdjusted)} margin=${"%.4f".format(margin)} samples=$classSampleCounts reason=best_ranked"
         )
-        return ClassificationResult(best.key, best.value, true)
+        return ClassificationResult(best.state, best.scoreLegacyAdjusted, true)
+    }
+
+    private fun computeTransferLaneCoherence(context: SpatialContext): Float {
+        val expectedCenterNorm = when (context.transferId) {
+            100 -> 1f / 6f
+            200 -> 3f / 6f
+            300 -> 5f / 6f
+            else -> context.centerYNorm
+        }
+        val diff = abs(context.centerYNorm - expectedCenterNorm)
+        return (1f - (diff / MAX_CENTER_NORM_DELTA)).coerceIn(0f, 1f)
+    }
+
+    private fun applyLaneCoherence(score: Float, laneCoherence: Float, state: TransferState): Float {
+        if (state == TransferState.UNKNOWN) return score
+        val adjustment = 0.92f + (laneCoherence * 0.16f)
+        return (score * adjustment).coerceIn(0f, 1f)
+    }
+
+    private fun calculateSpatialSimilarity(
+        context: SpatialContext,
+        sampleMeta: TemplateStorage.SpatialMetadata
+    ): Float {
+        val centerDelta = abs(context.centerYNorm - sampleMeta.centerYNorm)
+        val heightDelta = abs(context.roiHeightNorm - sampleMeta.roiHeightNorm)
+
+        val centerScore = (1f - (centerDelta / MAX_CENTER_NORM_DELTA)).coerceIn(0f, 1f)
+        val heightScore = (1f - (heightDelta / MAX_HEIGHT_NORM_DELTA)).coerceIn(0f, 1f)
+        return (centerScore * 0.75f + heightScore * 0.25f).coerceIn(0f, 1f)
     }
     
     private fun extractROI(image: Image, imageWidth: Int, imageHeight: Int, roi: LaneDetector.LaneRegion): Bitmap? {

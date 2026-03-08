@@ -46,6 +46,12 @@ class TransferMonitor(
             for (i in transferIds.indices) {
                 val transferId = transferIds[i]
                 val lane = lanes[i]
+                val laneCenterY = (lane.top + lane.bottom) / 2f
+                val laneCenterNorm = laneCenterY / bitmap.height.toFloat()
+                Log.d(
+                    TAG,
+                    "Transfer $transferId laneContext bitmap top=${lane.top} bottom=${lane.bottom} centerY=${"%.1f".format(laneCenterY)} centerYNorm=${"%.4f".format(laneCenterNorm)}"
+                )
 
                 // Classify the ROI
                 val classification = templateClassifier.classifyROI(
@@ -112,6 +118,12 @@ class TransferMonitor(
             for (i in transferIds.indices) {
                 val transferId = transferIds[i]
                 val lane = lanes[i]
+                val laneCenterY = (lane.top + lane.bottom) / 2f
+                val laneCenterNorm = laneCenterY / imageHeight.toFloat()
+                Log.d(
+                    TAG,
+                    "Transfer $transferId laneContext yuv top=${lane.top} bottom=${lane.bottom} centerY=${"%.1f".format(laneCenterY)} centerYNorm=${"%.4f".format(laneCenterNorm)}"
+                )
                 
                 // Classify the ROI
                 val classification = templateClassifier.classifyROI(
@@ -158,12 +170,38 @@ class TransferMonitor(
     }
 
     fun addLabeledSample(transferId: Int, state: TransferState, bitmap: Bitmap): Boolean {
+        return addLabeledSample(transferId, state, bitmap, null, bitmap.width, bitmap.height)
+    }
+
+    fun addLabeledSample(
+        transferId: Int,
+        state: TransferState,
+        bitmap: Bitmap,
+        laneRegion: LaneDetector.LaneRegion?,
+        frameWidth: Int,
+        frameHeight: Int
+    ): Boolean {
         if (state == TransferState.UNKNOWN) {
             Log.w(TAG, "Rejected labeled sample for UNKNOWN state")
             return false
         }
-        val success = templateStorage.saveTemplate(transferId, state, bitmap)
-        Log.d(TAG, "Labeled sample save result transfer=$transferId state=$state success=$success")
+
+        val spatialMetadata = laneRegion?.let {
+            TemplateStorage.SpatialMetadata(
+                left = it.left,
+                top = it.top,
+                right = it.right,
+                bottom = it.bottom,
+                frameWidth = frameWidth,
+                frameHeight = frameHeight
+            )
+        }
+
+        val success = templateStorage.saveTemplate(transferId, state, bitmap, spatialMetadata)
+        Log.d(
+            TAG,
+            "Labeled sample save result transfer=$transferId state=$state success=$success roi=${laneRegion ?: "legacy/no-roi"} frame=${frameWidth}x${frameHeight}"
+        )
         return success
     }
     

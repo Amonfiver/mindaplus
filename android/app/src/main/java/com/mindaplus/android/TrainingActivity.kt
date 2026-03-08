@@ -42,6 +42,8 @@ class TrainingActivity : ComponentActivity() {
     private var lastCapturedTransfer by mutableStateOf<Int?>(null)
     private var lastCapturedState by mutableStateOf<TransferState?>(null)
     private var pendingTemplateBitmap by mutableStateOf<Bitmap?>(null)
+    private var pendingFrameWidth by mutableStateOf<Int?>(null)
+    private var pendingFrameHeight by mutableStateOf<Int?>(null)
     
     companion object {
         private const val TAG = "TrainingActivity"
@@ -521,6 +523,8 @@ class TrainingActivity : ComponentActivity() {
                 lastCapturedTransfer = selectedTransfer
                 lastCapturedState = selectedState
                 pendingTemplateBitmap = croppedBitmap // Guardar para cuando se pulse "Guardar"
+                pendingFrameWidth = bitmap.width
+                pendingFrameHeight = bitmap.height
                 
                 showMessage("Template capturado exitosamente - Región detectada: ${targetLane.left},${targetLane.top} a ${targetLane.right},${targetLane.bottom}")
                 
@@ -572,6 +576,9 @@ class TrainingActivity : ComponentActivity() {
                 val templateBitmap = pendingTemplateBitmap
                 val transfer = lastCapturedTransfer
                 val state = lastCapturedState
+                val laneRegion = detectedLaneRegion
+                val frameWidth = pendingFrameWidth
+                val frameHeight = pendingFrameHeight
                 
                 if (templateBitmap == null || transfer == null || state == null) {
                     Log.e(TAG, "No pending template to save")
@@ -580,9 +587,20 @@ class TrainingActivity : ComponentActivity() {
                 }
                 
                 // Guardar el template en TemplateStorage
-                val success = transferMonitor.addLabeledSample(transfer, state, templateBitmap)
+                val success = transferMonitor.addLabeledSample(
+                    transferId = transfer,
+                    state = state,
+                    bitmap = templateBitmap,
+                    laneRegion = laneRegion,
+                    frameWidth = frameWidth ?: templateBitmap.width,
+                    frameHeight = frameHeight ?: templateBitmap.height
+                )
                 if (success) {
-                    Log.d(TAG, "Template saved successfully for T$transfer ${state.displayName}")
+                    val centerY = laneRegion?.let { (it.top + it.bottom) / 2f }
+                    Log.d(
+                        TAG,
+                        "Template saved successfully for T$transfer ${state.displayName} lane=${laneRegion ?: "legacy/no-roi"} centerY=${centerY?.let { "%.1f".format(it) } ?: "n/a"} frame=${frameWidth ?: templateBitmap.width}x${frameHeight ?: templateBitmap.height}"
+                    )
                     
                     // Actualizar progreso
                     updateTrainingProgress()
@@ -624,6 +642,8 @@ class TrainingActivity : ComponentActivity() {
         lastCapturedTransfer = null
         lastCapturedState = null
         pendingTemplateBitmap = null
+        pendingFrameWidth = null
+        pendingFrameHeight = null
     }
     
     private fun imageToBitmap(image: Image): Bitmap? {

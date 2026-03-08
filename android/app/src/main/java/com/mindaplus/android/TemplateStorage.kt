@@ -14,12 +14,40 @@ class TemplateStorage(private val context: Context) {
         private const val TAG = "TemplateStorage"
         private const val TEMPLATES_DIR = "templates"
         private const val MANIFEST_FILE = "manifest.json"
-        private const val TEMPLATE_VERSION = "0.3"
+        private const val TEMPLATE_VERSION = "0.4"
+        private const val SPATIAL_METADATA_VERSION = 1
         private const val TEMPLATE_WIDTH = 128
         private const val TEMPLATE_HEIGHT = 64
         private val TRAINING_TRANSFERS = listOf(100, 200, 300)
         private val TRAINING_STATES = listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)
     }
+
+    data class SpatialMetadata(
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+        val frameWidth: Int,
+        val frameHeight: Int
+    ) {
+        val roiHeight: Int
+            get() = (bottom - top).coerceAtLeast(1)
+
+        val centerY: Float
+            get() = (top + bottom) / 2f
+
+        val centerYNorm: Float
+            get() = if (frameHeight > 0) centerY / frameHeight.toFloat() else 0f
+
+        val roiHeightNorm: Float
+            get() = if (frameHeight > 0) roiHeight / frameHeight.toFloat() else 0f
+    }
+
+    data class TemplateSample(
+        val fileName: String,
+        val bitmap: Bitmap,
+        val spatialMetadata: SpatialMetadata?
+    )
     
     data class TemplateManifest(
         val version: String,
@@ -45,6 +73,15 @@ class TemplateStorage(private val context: Context) {
     }
     
     fun saveTemplate(transferId: Int, state: TransferState, bitmap: Bitmap): Boolean {
+        return saveTemplate(transferId, state, bitmap, null)
+    }
+
+    fun saveTemplate(
+        transferId: Int,
+        state: TransferState,
+        bitmap: Bitmap,
+        spatialMetadata: SpatialMetadata?
+    ): Boolean {
         try {
             if (state == TransferState.UNKNOWN) {
                 Log.w(TAG, "Cannot save template for UNKNOWN state")
@@ -60,6 +97,8 @@ class TemplateStorage(private val context: Context) {
             FileOutputStream(file).use { out ->
                 resizedBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
+
+            saveSpatialMetadata(file, transferId, state, spatialMetadata)
             
             Log.d(TAG, "Template saved: $filename")
             updateManifest()
@@ -76,15 +115,28 @@ class TemplateStorage(private val context: Context) {
     }
 
     fun loadTemplates(transferId: Int, state: TransferState): List<Bitmap> {
+        return loadTemplateSamples(transferId, state).map { it.bitmap }
+    }
+
+    fun loadTemplateSamples(transferId: Int, state: TransferState): List<TemplateSample> {
         try {
             if (state == TransferState.UNKNOWN) {
                 return emptyList()
             }
 
             val files = listTemplateFilesForClass(transferId, state)
-            val bitmaps = files.mapNotNull { BitmapFactory.decodeFile(it.absolutePath) }
-            Log.d(TAG, "Loaded ${bitmaps.size} templates for T$transferId ${state.displayName}")
-            return bitmaps
+            val samples = files.mapNotNull { file ->
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return@mapNotNull null
+                val metadata = loadSpatialMetadata(file)
+                TemplateSample(file.name, bitmap, metadata)
+            }
+
+            val withSpatial = samples.count { it.spatialMetadata != null }
+            Log.d(
+                TAG,
+                "Loaded ${samples.size} templates for T$transferId ${state.displayName} (spatialMeta=$withSpatial)"
+            )
+            return samples
         } catch (e: Exception) {
             Log.e(TAG, "Error loading template for T$transferId $state", e)
             return emptyList()
@@ -159,6 +211,7 @@ class TemplateStorage(private val context: Context) {
             templatesDir.listFiles()?.forEach { file ->
                 if (file.name.endsWith(".png")) {
                     file.delete()
+                    getMetadataFile(file).delete()
                 }
             }
             
@@ -198,6 +251,76 @@ class TemplateStorage(private val context: Context) {
         return "t${transferId}_${getStateSuffix(state)}"
     }
 
+    private fun getMetadataFile(templateFile: File): File {
+        return File(templatesDir, "${templateFile.name}.meta.json")
+    }
+
+    private fun saveSpatialMetadata(
+        templateFile: File,
+        transferId: Int,
+        state: TransferState,
+        spatialMetadata: SpatialMetadata?
+    ) {
+        try {
+            val metadataFile = getMetadataFile(templateFile)
+            if (spatialMetadata == null) {
+                if (metadataFile.exists()) {
+                    metadataFile.delete()
+                }
+                return
+            }
+
+            val metadataJson = JSONObject().apply {
+                put("version", SPATIAL_METADATA_VERSION)
+                put("templateFile", templateFile.name)
+                put("transferId", transferId)
+                put("state", state.name)
+                put("left", spatialMetadata.left)
+                put("top", spatialMetadata.top)
+                put("right", spatialMetadata.right)
+                put("bottom", spatialMetadata.bottom)
+                put("frameWidth", spatialMetadata.frameWidth)
+                put("frameHeight", spatialMetadata.frameHeight)
+                put("centerY", spatialMetadata.centerY.toDouble())
+                put("centerYNorm", spatialMetadata.centerYNorm.toDouble())
+                put("roiHeight", spatialMetadata.roiHeight)
+                put("roiHeightNorm", spatialMetadata.roiHeightNorm.toDouble())
+            }
+            metadataFile.writeText(metadataJson.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed saving spatial metadata for ${templateFile.name}", e)
+        }
+    }
+
+    private fun loadSpatialMetadata(templateFile: File): SpatialMetadata? {
+        return try {
+            val metadataFile = getMetadataFile(templateFile)
+            if (!metadataFile.exists()) {
+                return null
+            }
+
+            val json = JSONObject(metadataFile.readText())
+            SpatialMetadata(
+                left = json.optInt("left", -1),
+                top = json.optInt("top", -1),
+                right = json.optInt("right", -1),
+                bottom = json.optInt("bottom", -1),
+                frameWidth = json.optInt("frameWidth", -1),
+                frameHeight = json.optInt("frameHeight", -1)
+            ).takeIf {
+                it.left >= 0 &&
+                    it.top >= 0 &&
+                    it.right > it.left &&
+                    it.bottom > it.top &&
+                    it.frameWidth > 0 &&
+                    it.frameHeight > 0
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed loading spatial metadata for ${templateFile.name}", e)
+            null
+        }
+    }
+
     private fun getStateSuffix(state: TransferState): String {
         return when (state) {
             TransferState.OK -> "ok"
@@ -232,6 +355,8 @@ class TemplateStorage(private val context: Context) {
                 JSONObject().apply {
                     put("version", manifest.version)
                     put("timestamp", manifest.timestamp)
+                    put("spatialMetadataVersion", SPATIAL_METADATA_VERSION)
+                    put("spatialMetadataEnabled", true)
                     put("baseCoverage", JSONObject(manifest.baseCoverage))
                     put("sampleCounts", JSONObject(manifest.sampleCounts))
                     put("totalSamples", manifest.totalSamples)
