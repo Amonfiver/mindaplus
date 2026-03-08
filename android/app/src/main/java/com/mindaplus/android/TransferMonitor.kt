@@ -10,6 +10,7 @@ class TransferMonitor(
 ) {
     companion object {
         private const val TAG = "TransferMonitor"
+        private val ALL_TRANSFERS = listOf(100, 200, 300)
     }
     
     // Core components
@@ -41,11 +42,16 @@ class TransferMonitor(
 
             // Step 2: Classify each lane using template matching
             val results = mutableMapOf<Int, TransferState>()
-            val transferIds = listOf(100, 200, 300)
+            val transferIds = MonitoringMode.enabledTransfers
 
-            for (i in transferIds.indices) {
-                val transferId = transferIds[i]
-                val lane = lanes[i]
+            for (transferId in transferIds) {
+                val laneIndex = ALL_TRANSFERS.indexOf(transferId)
+                if (laneIndex < 0 || laneIndex >= lanes.size) {
+                    Log.w(TAG, "Transfer $transferId skipped: lane index $laneIndex out of range (${lanes.size})")
+                    results[transferId] = TransferState.UNKNOWN
+                    continue
+                }
+                val lane = lanes[laneIndex]
                 val laneCenterY = (lane.top + lane.bottom) / 2f
                 val laneCenterNorm = laneCenterY / bitmap.height.toFloat()
                 Log.d(
@@ -74,6 +80,12 @@ class TransferMonitor(
 
                 // Use confirmed state, or previous state if not confirmed
                 results[transferId] = confirmation.confirmedState ?: TransferState.UNKNOWN
+            }
+
+            for (transferId in ALL_TRANSFERS) {
+                if (!MonitoringMode.isTransferEnabled(transferId)) {
+                    results[transferId] = TransferState.UNKNOWN
+                }
             }
 
             Log.d(TAG, "Bitmap frame analysis complete at ts=$analysisTs: $results")
@@ -113,11 +125,16 @@ class TransferMonitor(
             
             // Step 2: Classify each lane using template matching
             val results = mutableMapOf<Int, TransferState>()
-            val transferIds = listOf(100, 200, 300)
+            val transferIds = MonitoringMode.enabledTransfers
             
-            for (i in transferIds.indices) {
-                val transferId = transferIds[i]
-                val lane = lanes[i]
+            for (transferId in transferIds) {
+                val laneIndex = ALL_TRANSFERS.indexOf(transferId)
+                if (laneIndex < 0 || laneIndex >= lanes.size) {
+                    Log.w(TAG, "Transfer $transferId skipped: lane index $laneIndex out of range (${lanes.size})")
+                    results[transferId] = TransferState.UNKNOWN
+                    continue
+                }
+                val lane = lanes[laneIndex]
                 val laneCenterY = (lane.top + lane.bottom) / 2f
                 val laneCenterNorm = laneCenterY / imageHeight.toFloat()
                 Log.d(
@@ -146,6 +163,12 @@ class TransferMonitor(
                 
                 // Use confirmed state, or previous state if not confirmed
                 results[transferId] = confirmation.confirmedState ?: TransferState.UNKNOWN
+            }
+
+            for (transferId in ALL_TRANSFERS) {
+                if (!MonitoringMode.isTransferEnabled(transferId)) {
+                    results[transferId] = TransferState.UNKNOWN
+                }
             }
             
             Log.d(TAG, "Frame analysis complete at ts=$analysisTs: $results")
@@ -183,6 +206,14 @@ class TransferMonitor(
     ): Boolean {
         if (state == TransferState.UNKNOWN) {
             Log.w(TAG, "Rejected labeled sample for UNKNOWN state")
+            return false
+        }
+        if (!MonitoringMode.isTransferEnabled(transferId)) {
+            Log.w(TAG, "Rejected labeled sample for disabled transfer T$transferId (singleLaneTestMode=${MonitoringMode.singleLaneTestMode})")
+            return false
+        }
+        if (!MonitoringMode.isStateEnabled(state)) {
+            Log.w(TAG, "Rejected labeled sample for disabled state $state (singleLaneTestMode=${MonitoringMode.singleLaneTestMode})")
             return false
         }
 

@@ -116,7 +116,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
             "Transfer $transferId context top=${spatialContext.top} bottom=${spatialContext.bottom} centerY=${"%.1f".format(spatialContext.centerY)} centerYNorm=${"%.4f".format(spatialContext.centerYNorm)} roiHeightNorm=${"%.4f".format(spatialContext.roiHeightNorm)} laneCoherence=${"%.4f".format(laneCoherence)}"
         )
 
-        for (state in listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)) {
+        val enabledStates = MonitoringMode.enabledTrainingStates
+        for (state in enabledStates) {
             val samples = templateStorage.loadTemplateSamples(transferId, state)
             classSampleCounts[state] = samples.size
 
@@ -177,9 +178,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         val margin = if (second != null) best.scoreLegacyAdjusted - second.scoreLegacyAdjusted else best.scoreLegacyAdjusted
 
         val okCandidate = candidates.firstOrNull { it.state == TransferState.OK }
-        val obstacleCandidate = candidates.firstOrNull { it.state == TransferState.OBSTACULO }
-        val falloCandidate = candidates.firstOrNull { it.state == TransferState.FALLO }
-        val bestAlert = listOfNotNull(obstacleCandidate, falloCandidate).maxByOrNull { it.scoreLegacyAdjusted }
+        val alertCandidates = candidates.filter { it.state != TransferState.OK }
+        val bestAlert = alertCandidates.maxByOrNull { it.scoreLegacyAdjusted }
 
         if (bestAlert != null) {
             val okScore = okCandidate?.scoreLegacyAdjusted ?: 0f

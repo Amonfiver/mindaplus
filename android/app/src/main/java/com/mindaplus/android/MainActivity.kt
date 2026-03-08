@@ -34,13 +34,13 @@ class MainActivity : ComponentActivity() {
     private var chatId by mutableStateOf("")
     private var isMonitoring by mutableStateOf(false)
     private var transferStates by mutableStateOf(mapOf(
-        100 to TransferState.OK,
-        200 to TransferState.OK,
-        300 to TransferState.OK
+        100 to TransferState.UNKNOWN,
+        200 to TransferState.UNKNOWN,
+        300 to TransferState.UNKNOWN
     ))
     private var previewView by mutableStateOf<PreviewView?>(null)
     private var isTrained by mutableStateOf(false)
-    private var trainingProgress by mutableStateOf(0 to 9)
+    private var trainingProgress by mutableStateOf(0 to (MonitoringMode.enabledTransfers.size * MonitoringMode.enabledTrainingStates.size).coerceAtLeast(1))
     private var totalTrainingSamples by mutableStateOf(0)
     
     // 5-second throttle mechanism
@@ -49,7 +49,7 @@ class MainActivity : ComponentActivity() {
     private var isAnalysisInProgress = false
 
     // Alerting policy
-    private val issueStates = setOf(TransferState.OBSTACULO, TransferState.FALLO)
+    private val issueStates = MonitoringMode.issueStatesForAlerts
     private val reAlertCooldownMs = 60_000L
     private val lastAlertTimestampByTransfer = mutableMapOf<Int, Long>()
     private val lastAlertStateByTransfer = mutableMapOf<Int, TransferState>()
@@ -164,6 +164,9 @@ class MainActivity : ComponentActivity() {
                 
                 // Check for state changes and send notifications
                 newStates.forEach { (transferId, newState) ->
+                    if (!MonitoringMode.isTransferEnabled(transferId)) {
+                        return@forEach
+                    }
                     val oldState = transferStates[transferId]
                     if (oldState != null) {
                         evaluateAndNotify(transferId, oldState, newState, currentTime)
@@ -225,6 +228,13 @@ class MainActivity : ComponentActivity() {
                     fontWeight = FontWeight.Bold,
                     color = Color.Magenta
                 )
+                if (MonitoringMode.singleLaneTestMode) {
+                    Text(
+                        text = "Modo temporal activo: monitorización T100 (OK/OBSTÁCULO)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color.Gray
+                    )
+                }
                 // Telegram Configuration
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -295,9 +305,9 @@ class MainActivity : ComponentActivity() {
                             fontWeight = FontWeight.Bold
                         )
                         
-                        TransferStatusRow(100, transferStates[100]!!)
-                        TransferStatusRow(200, transferStates[200]!!)
-                        TransferStatusRow(300, transferStates[300]!!)
+                        for (transferId in MonitoringMode.enabledTransfers) {
+                            TransferStatusRow(transferId, transferStates[transferId] ?: TransferState.UNKNOWN)
+                        }
                     }
                 }
                 
@@ -478,6 +488,11 @@ class MainActivity : ComponentActivity() {
         newState: TransferState,
         nowTs: Long
     ) {
+        if (!MonitoringMode.isTransferEnabled(transferId)) {
+            Log.d("Mindaplus", "MainActivity: Notification skipped for disabled transfer T$transferId")
+            return
+        }
+
         val lastAlertTs = lastAlertTimestampByTransfer[transferId]
         val lastAlertState = lastAlertStateByTransfer[transferId]
         Log.d(

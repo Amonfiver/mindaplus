@@ -31,9 +31,9 @@ class TrainingActivity : ComponentActivity() {
     private lateinit var laneDetector: LaneDetector
     
     private var previewView by mutableStateOf<PreviewView?>(null)
-    private var selectedTransfer by mutableStateOf(100)
-    private var selectedState by mutableStateOf(TransferState.OK)
-    private var trainingProgress by mutableStateOf(0 to 9)
+    private var selectedTransfer by mutableStateOf(MonitoringMode.enabledTransfers.firstOrNull() ?: 100)
+    private var selectedState by mutableStateOf(MonitoringMode.enabledTrainingStates.firstOrNull() ?: TransferState.OK)
+    private var trainingProgress by mutableStateOf(0 to (MonitoringMode.enabledTransfers.size * MonitoringMode.enabledTrainingStates.size).coerceAtLeast(1))
     private var totalSamples by mutableStateOf(0)
     private var isCapturing by mutableStateOf(false)
     private var lastCapturedBitmap by mutableStateOf<Bitmap?>(null)
@@ -174,7 +174,7 @@ class TrainingActivity : ComponentActivity() {
                         }
                         
                         LinearProgressIndicator(
-                            progress = trainingProgress.first.toFloat() / trainingProgress.second.toFloat(),
+                            progress = trainingProgress.first.toFloat() / trainingProgress.second.coerceAtLeast(1).toFloat(),
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -194,43 +194,31 @@ class TrainingActivity : ComponentActivity() {
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold
                         )
-                        
+
+                        if (MonitoringMode.singleLaneTestMode) {
+                            Text(
+                                text = "Modo temporal: solo T100 habilitado",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.Gray
+                            )
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Button(
-                                onClick = { selectedTransfer = 100 },
-                                modifier = Modifier.weight(1f),
-                                colors = if (selectedTransfer == 100) {
-                                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                                } else {
-                                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                            for (transferId in MonitoringMode.enabledTransfers) {
+                                Button(
+                                    onClick = { selectedTransfer = transferId },
+                                    modifier = Modifier.weight(1f),
+                                    colors = if (selectedTransfer == transferId) {
+                                        ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                                    } else {
+                                        ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                                    }
+                                ) {
+                                    Text("T$transferId")
                                 }
-                            ) {
-                                Text("T100")
-                            }
-                            Button(
-                                onClick = { selectedTransfer = 200 },
-                                modifier = Modifier.weight(1f),
-                                colors = if (selectedTransfer == 200) {
-                                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                                } else {
-                                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
-                                }
-                            ) {
-                                Text("T200")
-                            }
-                            Button(
-                                onClick = { selectedTransfer = 300 },
-                                modifier = Modifier.weight(1f),
-                                colors = if (selectedTransfer == 300) {
-                                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                                } else {
-                                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
-                                }
-                            ) {
-                                Text("T300")
                             }
                         }
                     }
@@ -255,29 +243,26 @@ class TrainingActivity : ComponentActivity() {
                             style = MaterialTheme.typography.bodyMedium,
                             color = Color.Gray
                         )
+                        if (MonitoringMode.singleLaneTestMode) {
+                            Text(
+                                text = "Modo temporal: FALLO desactivado",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray
+                            )
+                        }
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            FilterChip(
-                                selected = selectedState == TransferState.OK,
-                                onClick = { selectedState = TransferState.OK },
-                                label = { Text("OK") },
-                                modifier = Modifier.weight(1f)
-                            )
-                            FilterChip(
-                                selected = selectedState == TransferState.OBSTACULO,
-                                onClick = { selectedState = TransferState.OBSTACULO },
-                                label = { Text("OBSTÁCULO") },
-                                modifier = Modifier.weight(1f)
-                            )
-                            FilterChip(
-                                selected = selectedState == TransferState.FALLO,
-                                onClick = { selectedState = TransferState.FALLO },
-                                label = { Text("FALLO") },
-                                modifier = Modifier.weight(1f)
-                            )
+                            for (state in MonitoringMode.enabledTrainingStates) {
+                                FilterChip(
+                                    selected = selectedState == state,
+                                    onClick = { selectedState = state },
+                                    label = { Text(state.displayName) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                         }
 
                         Row(
@@ -454,6 +439,10 @@ class TrainingActivity : ComponentActivity() {
     
     private fun captureTemplate() {
         if (isCapturing) return
+        if (!MonitoringMode.isTransferEnabled(selectedTransfer) || !MonitoringMode.isStateEnabled(selectedState)) {
+            showMessage("Modo temporal: selección no habilitada")
+            return
+        }
         
         isCapturing = true
         Log.d(TAG, "Template capture started for T$selectedTransfer ${selectedState.displayName}")

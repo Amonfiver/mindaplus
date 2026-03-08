@@ -18,8 +18,8 @@ class TemplateStorage(private val context: Context) {
         private const val SPATIAL_METADATA_VERSION = 1
         private const val TEMPLATE_WIDTH = 128
         private const val TEMPLATE_HEIGHT = 64
-        private val TRAINING_TRANSFERS = listOf(100, 200, 300)
-        private val TRAINING_STATES = listOf(TransferState.OK, TransferState.OBSTACULO, TransferState.FALLO)
+        private val TRAINING_TRANSFERS = MonitoringMode.enabledTransfers
+        private val TRAINING_STATES = MonitoringMode.enabledTrainingStates
     }
 
     data class SpatialMetadata(
