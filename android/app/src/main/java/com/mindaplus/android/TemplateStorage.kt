@@ -14,6 +14,7 @@ class TemplateStorage(private val context: Context) {
         private const val TAG = "TemplateStorage"
         private const val TEMPLATES_DIR = "templates"
         private const val MANIFEST_FILE = "manifest.json"
+        private const val ROI_CALIBRATION_FILE = "roi_calibration.json"
         private const val TEMPLATE_VERSION = "0.4"
         private const val SPATIAL_METADATA_VERSION = 1
         private const val TEMPLATE_WIDTH = 128
@@ -48,6 +49,23 @@ class TemplateStorage(private val context: Context) {
         val bitmap: Bitmap,
         val spatialMetadata: SpatialMetadata?
     )
+
+    data class ManualRoi(
+        val leftNorm: Float,
+        val topNorm: Float,
+        val rightNorm: Float,
+        val bottomNorm: Float,
+        val updatedAt: Long
+    ) {
+        fun isValid(): Boolean {
+            return leftNorm in 0f..1f &&
+                topNorm in 0f..1f &&
+                rightNorm in 0f..1f &&
+                bottomNorm in 0f..1f &&
+                rightNorm > leftNorm &&
+                bottomNorm > topNorm
+        }
+    }
     
     data class TemplateManifest(
         val version: String,
@@ -292,6 +310,56 @@ class TemplateStorage(private val context: Context) {
         }
     }
 
+    fun saveManualRoi(transferId: Int, roi: ManualRoi): Boolean {
+        if (!roi.isValid()) {
+            Log.w(TAG, "Rejected invalid manual ROI for T$transferId: $roi")
+            return false
+        }
+        return try {
+            val all = loadAllManualRois().toMutableMap()
+            all[transferId] = roi.copy(updatedAt = System.currentTimeMillis())
+            writeManualRoiFile(all)
+            Log.d(TAG, "Saved manual ROI for T$transferId: $roi")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving manual ROI for T$transferId", e)
+            false
+        }
+    }
+
+    fun loadManualRoi(transferId: Int): ManualRoi? {
+        return loadAllManualRois()[transferId]
+    }
+
+    fun loadAllManualRois(): Map<Int, ManualRoi> {
+        return try {
+            val file = File(templatesDir, ROI_CALIBRATION_FILE)
+            if (!file.exists()) return emptyMap()
+
+            val json = JSONObject(file.readText())
+            val data = json.optJSONObject("transfers") ?: return emptyMap()
+            val out = mutableMapOf<Int, ManualRoi>()
+            data.keys().forEach { key ->
+                val transferId = key.removePrefix("t").toIntOrNull() ?: return@forEach
+                val roiJson = data.optJSONObject(key) ?: return@forEach
+                val roi = ManualRoi(
+                    leftNorm = roiJson.optDouble("leftNorm", -1.0).toFloat(),
+                    topNorm = roiJson.optDouble("topNorm", -1.0).toFloat(),
+                    rightNorm = roiJson.optDouble("rightNorm", -1.0).toFloat(),
+                    bottomNorm = roiJson.optDouble("bottomNorm", -1.0).toFloat(),
+                    updatedAt = roiJson.optLong("updatedAt", 0L)
+                )
+                if (roi.isValid()) {
+                    out[transferId] = roi
+                }
+            }
+            out
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading manual ROIs", e)
+            emptyMap()
+        }
+    }
+
     private fun loadSpatialMetadata(templateFile: File): SpatialMetadata? {
         return try {
             val metadataFile = getMetadataFile(templateFile)
@@ -328,6 +396,32 @@ class TemplateStorage(private val context: Context) {
             TransferState.FALLO -> "fallo"
             TransferState.UNKNOWN -> throw IllegalArgumentException("UNKNOWN has no template suffix")
         }
+    }
+
+    private fun writeManualRoiFile(rois: Map<Int, ManualRoi>) {
+        val file = File(templatesDir, ROI_CALIBRATION_FILE)
+        val payload = JSONObject().apply {
+            put("version", 1)
+            put("updatedAt", System.currentTimeMillis())
+            put(
+                "transfers",
+                JSONObject().apply {
+                    rois.forEach { (transferId, roi) ->
+                        put(
+                            "t$transferId",
+                            JSONObject().apply {
+                                put("leftNorm", roi.leftNorm.toDouble())
+                                put("topNorm", roi.topNorm.toDouble())
+                                put("rightNorm", roi.rightNorm.toDouble())
+                                put("bottomNorm", roi.bottomNorm.toDouble())
+                                put("updatedAt", roi.updatedAt)
+                            }
+                        )
+                    }
+                }
+            )
+        }
+        file.writeText(payload.toString())
     }
 
     private fun updateManifest() {

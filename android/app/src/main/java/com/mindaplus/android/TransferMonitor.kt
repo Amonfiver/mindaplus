@@ -18,6 +18,7 @@ class TransferMonitor(
     private val templateStorage = TemplateStorage(context)
     private val templateClassifier = TemplateClassifier(templateStorage)
     private val stateConfirmation = StateConfirmation()
+    private val latestDebugByTransfer = mutableMapOf<Int, TemplateClassifier.DebugSnapshot>()
 
     fun analyzeFrame(bitmap: Bitmap): Map<Int, TransferState> {
         try {
@@ -64,7 +65,8 @@ class TransferMonitor(
                     bitmap, lane, transferId
                 )
 
-                Log.d(TAG, "Transfer $transferId: detected=${classification.state}, similarity=${classification.similarity}, confident=${classification.isConfident}")
+                Log.d(TAG, "Transfer $transferId: detected=${classification.state}, similarity=${classification.similarity}, confident=${classification.isConfident}, reason=${classification.reason}")
+                templateClassifier.getLatestDebugSnapshot()?.let { latestDebugByTransfer[transferId] = it }
 
                 // Use detected state only if confident, otherwise UNKNOWN
                 val detectedState = if (classification.isConfident) {
@@ -147,7 +149,8 @@ class TransferMonitor(
                     image, imageWidth, imageHeight, lane, transferId
                 )
                 
-                Log.d(TAG, "Transfer $transferId: detected=${classification.state}, similarity=${classification.similarity}, confident=${classification.isConfident}")
+                Log.d(TAG, "Transfer $transferId: detected=${classification.state}, similarity=${classification.similarity}, confident=${classification.isConfident}, reason=${classification.reason}")
+                templateClassifier.getLatestDebugSnapshot()?.let { latestDebugByTransfer[transferId] = it }
                 
                 // Use detected state only if confident, otherwise UNKNOWN
                 val detectedState = if (classification.isConfident) {
@@ -190,6 +193,18 @@ class TransferMonitor(
 
     fun getTrainingStats(): TemplateStorage.TrainingStats {
         return templateStorage.getTrainingStats()
+    }
+
+    fun getManualRoi(transferId: Int): TemplateStorage.ManualRoi? {
+        return templateStorage.loadManualRoi(transferId)
+    }
+
+    fun saveManualRoi(transferId: Int, roi: TemplateStorage.ManualRoi): Boolean {
+        return templateStorage.saveManualRoi(transferId, roi)
+    }
+
+    fun getLatestDebugSnapshot(transferId: Int): TemplateClassifier.DebugSnapshot? {
+        return latestDebugByTransfer[transferId]
     }
 
     fun addLabeledSample(transferId: Int, state: TransferState, bitmap: Bitmap): Boolean {

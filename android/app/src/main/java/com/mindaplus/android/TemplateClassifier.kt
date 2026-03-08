@@ -26,12 +26,45 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         private const val MAX_HEIGHT_NORM_DELTA = 0.20f
         private const val STRUCTURAL_WEIGHT = 0.55f
         private const val COLOR_WEIGHT = 0.45f
+        private const val BACKGROUND_LOW_WEIGHT = 0.35f
     }
-    
+
+    data class StateDebug(
+        val sampleCount: Int,
+        val bestVisual: Float,
+        val bestStructural: Float,
+        val bestColor: Float,
+        val bestSpatial: Float,
+        val laneAdjusted: Float
+    )
+
     data class ClassificationResult(
         val state: TransferState,
         val similarity: Float,
-        val isConfident: Boolean
+        val isConfident: Boolean,
+        val reason: String = "unknown",
+        val stateDebug: Map<TransferState, StateDebug> = emptyMap()
+    )
+
+    data class RoiRectPx(
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int
+    )
+
+    data class DebugSnapshot(
+        val transferId: Int,
+        val strategy: String,
+        val laneBitmap: Bitmap,
+        val comparedBitmap: Bitmap,
+        val roiRectPx: RoiRectPx?,
+        val okReference: Bitmap?,
+        val obstaculoReference: Bitmap?,
+        val stateDebug: Map<TransferState, StateDebug>,
+        val finalState: TransferState,
+        val finalScore: Float,
+        val finalReason: String
     )
 
     private data class SpatialContext(
@@ -59,10 +92,9 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         val bestVisual: Float,
         val bestStructural: Float,
         val bestColor: Float,
-        val avgTopVisual: Float,
         val bestSpatial: Float,
         val score: Float,
-        val scoreLegacyAdjusted: Float
+        val laneAdjusted: Float
     )
 
     private data class VisualSimilarity(
@@ -71,69 +103,88 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         val combined: Float
     )
 
+    private data class ExtractionResult(
+        val laneBitmap: Bitmap,
+        val comparisonBitmap: Bitmap,
+        val strategy: String,
+        val roiRectPx: RoiRectPx?
+    )
+
+    @Volatile
+    private var latestDebugSnapshot: DebugSnapshot? = null
+
+    fun getLatestDebugSnapshot(): DebugSnapshot? = latestDebugSnapshot
+
     fun classifyROI(bitmap: Bitmap, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
-        try {
-            // Extract and normalize ROI from current frame
-            val currentROI = extractROI(bitmap, roi)
-            if (currentROI == null) {
+        return try {
+            val extraction = extractFromBitmap(bitmap, roi, transferId)
+            if (extraction == null) {
                 Log.w(TAG, "Failed to extract ROI for transfer $transferId")
-                return ClassificationResult(TransferState.UNKNOWN, 0f, false)
+                ClassificationResult(TransferState.UNKNOWN, 0f, false, "extract_failed")
+            } else {
+                val spatialContext = SpatialContext(
+                    transferId = transferId,
+                    top = roi.top,
+                    bottom = roi.bottom,
+                    frameHeight = bitmap.height
+                )
+                classifyFromExtraction(extraction, spatialContext)
             }
-            val spatialContext = SpatialContext(
-                transferId = transferId,
-                top = roi.top,
-                bottom = roi.bottom,
-                frameHeight = bitmap.height
-            )
-            return classifyFromRoi(currentROI, spatialContext)
-
         } catch (e: Exception) {
             Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
-            return ClassificationResult(TransferState.UNKNOWN, 0f, false)
-        }
-    }
-    
-    fun classifyROI(image: Image, imageWidth: Int, imageHeight: Int, roi: LaneDetector.LaneRegion, transferId: Int): ClassificationResult {
-        try {
-            // Extract and normalize ROI from current frame
-            val currentROI = extractROI(image, imageWidth, imageHeight, roi)
-            if (currentROI == null) {
-                Log.w(TAG, "Failed to extract ROI for transfer $transferId")
-                return ClassificationResult(TransferState.UNKNOWN, 0f, false)
-            }
-            val spatialContext = SpatialContext(
-                transferId = transferId,
-                top = roi.top,
-                bottom = roi.bottom,
-                frameHeight = imageHeight
-            )
-            return classifyFromRoi(currentROI, spatialContext)
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
-            return ClassificationResult(TransferState.UNKNOWN, 0f, false)
+            ClassificationResult(TransferState.UNKNOWN, 0f, false, "exception")
         }
     }
 
-    private fun classifyFromRoi(currentROI: Bitmap, spatialContext: SpatialContext): ClassificationResult {
+    fun classifyROI(
+        image: Image,
+        imageWidth: Int,
+        imageHeight: Int,
+        roi: LaneDetector.LaneRegion,
+        transferId: Int
+    ): ClassificationResult {
+        return try {
+            val extraction = extractFromImage(image, imageWidth, imageHeight, roi, transferId)
+            if (extraction == null) {
+                Log.w(TAG, "Failed to extract ROI for transfer $transferId")
+                ClassificationResult(TransferState.UNKNOWN, 0f, false, "extract_failed")
+            } else {
+                val spatialContext = SpatialContext(
+                    transferId = transferId,
+                    top = roi.top,
+                    bottom = roi.bottom,
+                    frameHeight = imageHeight
+                )
+                classifyFromExtraction(extraction, spatialContext)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error classifying ROI for transfer $transferId", e)
+            ClassificationResult(TransferState.UNKNOWN, 0f, false, "exception")
+        }
+    }
+
+    private fun classifyFromExtraction(
+        extraction: ExtractionResult,
+        spatialContext: SpatialContext
+    ): ClassificationResult {
         val transferId = spatialContext.transferId
+        val currentROI = extraction.comparisonBitmap
         val candidates = mutableListOf<CandidateScore>()
-        val classSampleCounts = mutableMapOf<TransferState, Int>()
         val laneCoherence = computeTransferLaneCoherence(spatialContext)
+        val enabledStates = MonitoringMode.enabledTrainingStates
+        var okReference: Bitmap? = null
+        var obstReference: Bitmap? = null
 
         Log.d(
             TAG,
-            "Transfer $transferId context top=${spatialContext.top} bottom=${spatialContext.bottom} centerY=${"%.1f".format(spatialContext.centerY)} centerYNorm=${"%.4f".format(spatialContext.centerYNorm)} roiHeightNorm=${"%.4f".format(spatialContext.roiHeightNorm)} laneCoherence=${"%.4f".format(laneCoherence)} visualMode=color_aware(structural+lchroma)"
+            "Transfer $transferId context strategy=${extraction.strategy} lane=${extraction.laneBitmap.width}x${extraction.laneBitmap.height} compared=${currentROI.width}x${currentROI.height} manualRoiPx=${extraction.roiRectPx} laneCoherence=${"%.4f".format(laneCoherence)} visualMode=color_aware(structural+lchroma) backgroundAttenuation=enabled"
         )
 
-        val enabledStates = MonitoringMode.enabledTrainingStates
         for (state in enabledStates) {
             val samples = templateStorage.loadTemplateSamples(transferId, state)
-            classSampleCounts[state] = samples.size
-
-            if (samples.isEmpty()) {
-                continue
-            }
+            if (samples.isEmpty()) continue
+            if (state == TransferState.OK && okReference == null) okReference = samples.first().bitmap
+            if (state == TransferState.OBSTACULO && obstReference == null) obstReference = samples.first().bitmap
 
             var withSpatialCount = 0
             val perSampleScores = samples.map { sample ->
@@ -153,14 +204,11 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
             val bestVisual = perSampleScores.maxOfOrNull { it.first.combined } ?: 0f
             val bestStructural = perSampleScores.maxOfOrNull { it.first.structural } ?: 0f
             val bestColor = perSampleScores.maxOfOrNull { it.first.color } ?: 0f
-            val avgTopVisual = perSampleScores.map { it.first.combined }.sortedDescending().take(2).average().toFloat()
             val bestSpatial = perSampleScores.mapNotNull { it.second }.maxOrNull() ?: 0f
-
             val top2Combined = perSampleScores.map { it.third }.sortedDescending().take(2)
             val avgTopCombined = top2Combined.average().toFloat()
             val bestCombined = top2Combined.firstOrNull() ?: 0f
             val score = (bestCombined * 0.7f) + (avgTopCombined * 0.3f)
-
             val laneAdjusted = applyLaneCoherence(score, laneCoherence, state)
 
             candidates += CandidateScore(
@@ -169,75 +217,99 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
                 bestVisual = bestVisual,
                 bestStructural = bestStructural,
                 bestColor = bestColor,
-                avgTopVisual = avgTopVisual,
                 bestSpatial = bestSpatial,
                 score = score,
-                scoreLegacyAdjusted = laneAdjusted
+                laneAdjusted = laneAdjusted
             )
 
             Log.d(
                 TAG,
-                "Transfer $transferId state=$state samples=${samples.size} withSpatial=$withSpatialCount bestVisual=${"%.4f".format(bestVisual)} bestStructural=${"%.4f".format(bestStructural)} bestColor=${"%.4f".format(bestColor)} avgTopVisual=${"%.4f".format(avgTopVisual)} bestSpatial=${"%.4f".format(bestSpatial)} score=${"%.4f".format(score)} laneAdj=${"%.4f".format(laneAdjusted)}"
+                "Transfer $transferId state=$state samples=${samples.size} withSpatial=$withSpatialCount bestVisual=${"%.4f".format(bestVisual)} bestStructural=${"%.4f".format(bestStructural)} bestColor=${"%.4f".format(bestColor)} bestSpatial=${"%.4f".format(bestSpatial)} score=${"%.4f".format(score)} laneAdj=${"%.4f".format(laneAdjusted)}"
             )
         }
 
         if (candidates.isEmpty()) {
-            Log.w(TAG, "No templates found for transfer $transferId (all classes empty)")
-            return ClassificationResult(TransferState.UNKNOWN, 0f, false)
+            val result = ClassificationResult(TransferState.UNKNOWN, 0f, false, "no_templates")
+            latestDebugSnapshot = buildDebugSnapshot(transferId, extraction, okReference, obstReference, result, emptyMap())
+            return result
         }
 
-        val ranked = candidates.sortedByDescending { it.scoreLegacyAdjusted }
+        val stateDebug = candidates.associate {
+            it.state to StateDebug(
+                sampleCount = it.sampleCount,
+                bestVisual = it.bestVisual,
+                bestStructural = it.bestStructural,
+                bestColor = it.bestColor,
+                bestSpatial = it.bestSpatial,
+                laneAdjusted = it.laneAdjusted
+            )
+        }
+
+        val ranked = candidates.sortedByDescending { it.laneAdjusted }
         val best = ranked[0]
         val second = ranked.getOrNull(1)
-        val margin = if (second != null) best.scoreLegacyAdjusted - second.scoreLegacyAdjusted else best.scoreLegacyAdjusted
-
+        val margin = if (second != null) best.laneAdjusted - second.laneAdjusted else best.laneAdjusted
         val okCandidate = candidates.firstOrNull { it.state == TransferState.OK }
-        val alertCandidates = candidates.filter { it.state != TransferState.OK }
-        val bestAlert = alertCandidates.maxByOrNull { it.scoreLegacyAdjusted }
+        val bestAlert = candidates.filter { it.state != TransferState.OK }.maxByOrNull { it.laneAdjusted }
 
-        if (bestAlert != null) {
-            val okScore = okCandidate?.scoreLegacyAdjusted ?: 0f
-            val alertOverOk = bestAlert.scoreLegacyAdjusted - okScore
-            val alertStrong = bestAlert.scoreLegacyAdjusted >= ALERT_MATCH_THRESHOLD
-            if (alertStrong && alertOverOk >= ALERT_OVER_OK_MARGIN && margin >= AMBIGUITY_MARGIN) {
-                Log.d(
-                    TAG,
-                    "Transfer $transferId decision=${bestAlert.state} reason=strong_alert score=${"%.4f".format(bestAlert.scoreLegacyAdjusted)} overOk=${"%.4f".format(alertOverOk)} margin=${"%.4f".format(margin)}"
-                )
-                return ClassificationResult(bestAlert.state, bestAlert.scoreLegacyAdjusted, true)
+        val result = when {
+            bestAlert != null && bestAlert.laneAdjusted >= ALERT_MATCH_THRESHOLD &&
+                (bestAlert.laneAdjusted - (okCandidate?.laneAdjusted ?: 0f)) >= ALERT_OVER_OK_MARGIN &&
+                margin >= AMBIGUITY_MARGIN -> {
+                ClassificationResult(bestAlert.state, bestAlert.laneAdjusted, true, "strong_alert", stateDebug)
             }
-        }
-
-        if (okCandidate != null && laneCoherence >= LANE_COHERENCE_MIN_FOR_OK) {
-            val bestAlertScore = bestAlert?.scoreLegacyAdjusted ?: 0f
-            val noStrongAlert = bestAlertScore < ALERT_MATCH_THRESHOLD
-            val okByDiscardScore = max(okCandidate.scoreLegacyAdjusted, (okCandidate.score * 0.75f) + (laneCoherence * 0.25f))
-            if (noStrongAlert && okByDiscardScore >= OK_BASELINE_MIN) {
-                Log.d(
-                    TAG,
-                    "Transfer $transferId decision=OK reason=baseline_discard okScore=${"%.4f".format(okCandidate.scoreLegacyAdjusted)} okDiscard=${"%.4f".format(okByDiscardScore)} bestAlert=${"%.4f".format(bestAlertScore)} laneCoherence=${"%.4f".format(laneCoherence)}"
-                )
-                return ClassificationResult(TransferState.OK, okByDiscardScore, true)
+            okCandidate != null && laneCoherence >= LANE_COHERENCE_MIN_FOR_OK &&
+                (bestAlert?.laneAdjusted ?: 0f) < ALERT_MATCH_THRESHOLD -> {
+                val okByDiscard = max(okCandidate.laneAdjusted, (okCandidate.score * 0.75f) + (laneCoherence * 0.25f))
+                if (okByDiscard >= OK_BASELINE_MIN) {
+                    ClassificationResult(TransferState.OK, okByDiscard, true, "baseline_discard", stateDebug)
+                } else {
+                    ClassificationResult(TransferState.UNKNOWN, best.laneAdjusted, false, "unknown_ambiguity", stateDebug)
+                }
             }
-        }
-
-        val isConfident = best.scoreLegacyAdjusted >= SIMILARITY_THRESHOLD && margin >= AMBIGUITY_MARGIN
-        if (!isConfident) {
-            Log.w(
-                TAG,
-                "Transfer $transferId ambiguous/low confidence. best=${best.state}:${"%.4f".format(best.scoreLegacyAdjusted)} second=${second?.state}:${"%.4f".format(second?.scoreLegacyAdjusted ?: 0f)} margin=${"%.4f".format(margin)} laneCoherence=${"%.4f".format(laneCoherence)} samples=$classSampleCounts reason=unknown_ambiguity"
-            )
-            return ClassificationResult(TransferState.UNKNOWN, best.scoreLegacyAdjusted, false)
+            best.laneAdjusted >= SIMILARITY_THRESHOLD && margin >= AMBIGUITY_MARGIN -> {
+                ClassificationResult(best.state, best.laneAdjusted, true, "best_ranked", stateDebug)
+            }
+            else -> {
+                ClassificationResult(TransferState.UNKNOWN, best.laneAdjusted, false, "unknown_ambiguity", stateDebug)
+            }
         }
 
         Log.d(
             TAG,
-            "Transfer $transferId classified=${best.state} score=${"%.4f".format(best.scoreLegacyAdjusted)} margin=${"%.4f".format(margin)} samples=$classSampleCounts reason=best_ranked"
+            "Transfer $transferId decision=${result.state} reason=${result.reason} score=${"%.4f".format(result.similarity)} margin=${"%.4f".format(margin)}"
         )
-        return ClassificationResult(best.state, best.scoreLegacyAdjusted, true)
+        latestDebugSnapshot = buildDebugSnapshot(transferId, extraction, okReference, obstReference, result, stateDebug)
+        return result
     }
 
-    private fun calculateVisualSimilarityWithTemplateFallback(currentRoi: Bitmap, templateBitmap: Bitmap): VisualSimilarity {
+    private fun buildDebugSnapshot(
+        transferId: Int,
+        extraction: ExtractionResult,
+        okReference: Bitmap?,
+        obstReference: Bitmap?,
+        result: ClassificationResult,
+        stateDebug: Map<TransferState, StateDebug>
+    ): DebugSnapshot {
+        return DebugSnapshot(
+            transferId = transferId,
+            strategy = extraction.strategy,
+            laneBitmap = extraction.laneBitmap,
+            comparedBitmap = extraction.comparisonBitmap,
+            roiRectPx = extraction.roiRectPx,
+            okReference = okReference,
+            obstaculoReference = obstReference,
+            stateDebug = stateDebug,
+            finalState = result.state,
+            finalScore = result.similarity,
+            finalReason = result.reason
+        )
+    }
+
+    private fun calculateVisualSimilarityWithTemplateFallback(
+        currentRoi: Bitmap,
+        templateBitmap: Bitmap
+    ): VisualSimilarity {
         val asIs = calculateVisualSimilarity(currentRoi, templateBitmap)
         val focusedTemplate = if (MonitoringMode.focusedSubRoiEnabled) {
             focusRoi(templateBitmap, "template", logDetails = false)
@@ -271,196 +343,205 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
     ): Float {
         val centerDelta = abs(context.centerYNorm - sampleMeta.centerYNorm)
         val heightDelta = abs(context.roiHeightNorm - sampleMeta.roiHeightNorm)
-
         val centerScore = (1f - (centerDelta / MAX_CENTER_NORM_DELTA)).coerceIn(0f, 1f)
         val heightScore = (1f - (heightDelta / MAX_HEIGHT_NORM_DELTA)).coerceIn(0f, 1f)
         return (centerScore * 0.75f + heightScore * 0.25f).coerceIn(0f, 1f)
     }
-    
-    private fun extractROI(image: Image, imageWidth: Int, imageHeight: Int, roi: LaneDetector.LaneRegion): Bitmap? {
-        try {
-            if (image.format != ImageFormat.YUV_420_888) {
-                Log.w(TAG, "Unsupported image format: ${image.format}")
-                return null
-            }
-            
-            val yPlane = image.planes[0]
-            val yBuffer = yPlane.buffer
-            val yRowStride = yPlane.rowStride
-            
-            // Ensure ROI is within bounds
-            val left = max(0, min(roi.left, imageWidth - 1))
-            val top = max(0, min(roi.top, imageHeight - 1))
-            val right = max(left + 1, min(roi.right, imageWidth))
-            val bottom = max(top + 1, min(roi.bottom, imageHeight))
-            
-            val roiWidth = right - left
-            val roiHeight = bottom - top
-            
-            if (roiWidth <= 0 || roiHeight <= 0) {
-                Log.w(TAG, "Invalid ROI dimensions: ${roiWidth}x${roiHeight}")
-                return null
-            }
-            
-            // Create color bitmap from YUV planes
-            val bitmap = Bitmap.createBitmap(roiWidth, roiHeight, Bitmap.Config.ARGB_8888)
-            val uPlane = image.planes[1]
-            val vPlane = image.planes[2]
-            val uBuffer = uPlane.buffer
-            val vBuffer = vPlane.buffer
-            val yPixelStride = yPlane.pixelStride
-            val uPixelStride = uPlane.pixelStride
-            val vPixelStride = vPlane.pixelStride
-            val uRowStride = uPlane.rowStride
-            val vRowStride = vPlane.rowStride
-            
-            for (y in top until bottom) {
-                val rowStart = y * yRowStride
-                for (x in left until right) {
-                    val yValue = yBuffer.get(rowStart + (x * yPixelStride)).toInt() and 0xFF
-                    val uvX = x / 2
-                    val uvY = y / 2
-                    val uValue = uBuffer.get(uvY * uRowStride + uvX * uPixelStride).toInt() and 0xFF
-                    val vValue = vBuffer.get(uvY * vRowStride + uvX * vPixelStride).toInt() and 0xFF
 
-                    val c = (yValue - 16).coerceAtLeast(0)
-                    val d = uValue - 128
-                    val e = vValue - 128
-                    val r = ((298 * c + 409 * e + 128) shr 8).coerceIn(0, 255)
-                    val g = ((298 * c - 100 * d - 208 * e + 128) shr 8).coerceIn(0, 255)
-                    val b = ((298 * c + 516 * d + 128) shr 8).coerceIn(0, 255)
-                    val rgb = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                    bitmap.setPixel(x - left, y - top, rgb)
-                }
-            }
-            
-            val focused = focusRoi(bitmap, "current_yuv", logDetails = true)
-            return Bitmap.createScaledBitmap(focused, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error extracting ROI", e)
-            return null
-        }
+    private fun extractFromBitmap(
+        frame: Bitmap,
+        lane: LaneDetector.LaneRegion,
+        transferId: Int
+    ): ExtractionResult? {
+        val imageWidth = frame.width
+        val imageHeight = frame.height
+        val left = max(0, min(lane.left, imageWidth - 1))
+        val top = max(0, min(lane.top, imageHeight - 1))
+        val right = max(left + 1, min(lane.right, imageWidth))
+        val bottom = max(top + 1, min(lane.bottom, imageHeight))
+        val laneWidth = right - left
+        val laneHeight = bottom - top
+        if (laneWidth <= 0 || laneHeight <= 0) return null
+
+        val laneBitmap = Bitmap.createBitmap(frame, left, top, laneWidth, laneHeight)
+        return buildExtraction(transferId, laneBitmap, "current_bitmap")
     }
 
-    private fun extractROI(bitmap: Bitmap, roi: LaneDetector.LaneRegion): Bitmap? {
-        try {
-            val imageWidth = bitmap.width
-            val imageHeight = bitmap.height
-
-            // Ensure ROI is within bounds
-            val left = max(0, min(roi.left, imageWidth - 1))
-            val top = max(0, min(roi.top, imageHeight - 1))
-            val right = max(left + 1, min(roi.right, imageWidth))
-            val bottom = max(top + 1, min(roi.bottom, imageHeight))
-
-            val roiWidth = right - left
-            val roiHeight = bottom - top
-
-            if (roiWidth <= 0 || roiHeight <= 0) {
-                Log.w(TAG, "Invalid ROI dimensions: ${roiWidth}x${roiHeight}")
-                return null
-            }
-
-            val roiBitmap = Bitmap.createBitmap(bitmap, left, top, roiWidth, roiHeight)
-            val focused = focusRoi(roiBitmap, "current_bitmap", logDetails = true)
-            return Bitmap.createScaledBitmap(focused, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error extracting ROI from bitmap", e)
+    private fun extractFromImage(
+        image: Image,
+        imageWidth: Int,
+        imageHeight: Int,
+        lane: LaneDetector.LaneRegion,
+        transferId: Int
+    ): ExtractionResult? {
+        if (image.format != ImageFormat.YUV_420_888) {
+            Log.w(TAG, "Unsupported image format: ${image.format}")
             return null
         }
+
+        val left = max(0, min(lane.left, imageWidth - 1))
+        val top = max(0, min(lane.top, imageHeight - 1))
+        val right = max(left + 1, min(lane.right, imageWidth))
+        val bottom = max(top + 1, min(lane.bottom, imageHeight))
+        val laneWidth = right - left
+        val laneHeight = bottom - top
+        if (laneWidth <= 0 || laneHeight <= 0) return null
+
+        val laneBitmap = Bitmap.createBitmap(laneWidth, laneHeight, Bitmap.Config.ARGB_8888)
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+        val yRowStride = yPlane.rowStride
+        val yPixelStride = yPlane.pixelStride
+        val uRowStride = uPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vRowStride = vPlane.rowStride
+        val vPixelStride = vPlane.pixelStride
+
+        for (y in top until bottom) {
+            val rowStart = y * yRowStride
+            for (x in left until right) {
+                val yValue = yBuffer.get(rowStart + (x * yPixelStride)).toInt() and 0xFF
+                val uvX = x / 2
+                val uvY = y / 2
+                val uValue = uBuffer.get(uvY * uRowStride + uvX * uPixelStride).toInt() and 0xFF
+                val vValue = vBuffer.get(uvY * vRowStride + uvX * vPixelStride).toInt() and 0xFF
+
+                val c = (yValue - 16).coerceAtLeast(0)
+                val d = uValue - 128
+                val e = vValue - 128
+                val r = ((298 * c + 409 * e + 128) shr 8).coerceIn(0, 255)
+                val g = ((298 * c - 100 * d - 208 * e + 128) shr 8).coerceIn(0, 255)
+                val b = ((298 * c + 516 * d + 128) shr 8).coerceIn(0, 255)
+                laneBitmap.setPixel(x - left, y - top, (0xFF shl 24) or (r shl 16) or (g shl 8) or b)
+            }
+        }
+
+        return buildExtraction(transferId, laneBitmap, "current_yuv")
     }
-    
-    private fun calculateVisualSimilarity(bitmap1: Bitmap, bitmap2: Bitmap): VisualSimilarity {
-        try {
-            if (bitmap1.width != bitmap2.width || bitmap1.height != bitmap2.height) {
-                Log.w(TAG, "Bitmap dimensions mismatch: ${bitmap1.width}x${bitmap1.height} vs ${bitmap2.width}x${bitmap2.height}")
-                return VisualSimilarity(0f, 0f, 0f)
-            }
-            
-            val width = bitmap1.width
-            val height = bitmap1.height
-            
-            var structuralDiffSum = 0f
-            var colorDiffSum = 0f
-            var pixelCount = 0
-            
-            // Sample every 4th pixel for performance
-            for (y in 0 until height step 4) {
-                for (x in 0 until width step 4) {
-                    val pixel1 = bitmap1.getPixel(x, y)
-                    val pixel2 = bitmap2.getPixel(x, y)
 
-                    val r1 = ((pixel1 shr 16) and 0xFF).toFloat()
-                    val g1 = ((pixel1 shr 8) and 0xFF).toFloat()
-                    val b1 = (pixel1 and 0xFF).toFloat()
-                    val r2 = ((pixel2 shr 16) and 0xFF).toFloat()
-                    val g2 = ((pixel2 shr 8) and 0xFF).toFloat()
-                    val b2 = (pixel2 and 0xFF).toFloat()
-
-                    val lum1 = (0.299f * r1) + (0.587f * g1) + (0.114f * b1)
-                    val lum2 = (0.299f * r2) + (0.587f * g2) + (0.114f * b2)
-                    structuralDiffSum += abs(lum1 - lum2) / 255f
-
-                    val sum1 = (r1 + g1 + b1).coerceAtLeast(1f)
-                    val sum2 = (r2 + g2 + b2).coerceAtLeast(1f)
-                    val nr1 = r1 / sum1
-                    val ng1 = g1 / sum1
-                    val nb1 = b1 / sum1
-                    val nr2 = r2 / sum2
-                    val ng2 = g2 / sum2
-                    val nb2 = b2 / sum2
-                    val chromaDiff = (abs(nr1 - nr2) + abs(ng1 - ng2) + abs(nb1 - nb2)) / 3f
-
-                    val sat1 = ((max(r1, max(g1, b1)) - min(r1, min(g1, b1))) / max(r1, max(g1, b1)).coerceAtLeast(1f))
-                    val sat2 = ((max(r2, max(g2, b2)) - min(r2, min(g2, b2))) / max(r2, max(g2, b2)).coerceAtLeast(1f))
-                    val saturationDiff = abs(sat1 - sat2)
-
-                    colorDiffSum += ((chromaDiff * 0.8f) + (saturationDiff * 0.2f)).coerceIn(0f, 1f)
-                    pixelCount++
-                }
-            }
-            
-            if (pixelCount == 0) {
-                return VisualSimilarity(0f, 0f, 0f)
-            }
-
-            val structuralSimilarity = (1f - (structuralDiffSum / pixelCount.toFloat())).coerceIn(0f, 1f)
-            val colorSimilarity = (1f - (colorDiffSum / pixelCount.toFloat())).coerceIn(0f, 1f)
-            val combined = ((structuralSimilarity * STRUCTURAL_WEIGHT) + (colorSimilarity * COLOR_WEIGHT)).coerceIn(0f, 1f)
-            return VisualSimilarity(
-                structural = structuralSimilarity,
-                color = colorSimilarity,
-                combined = combined
+    private fun buildExtraction(transferId: Int, laneBitmap: Bitmap, source: String): ExtractionResult {
+        val manual = templateStorage.loadManualRoi(transferId)
+        val manualCrop = manual?.let { cropByNormalized(laneBitmap, it) }
+        val cropped = if (manualCrop != null) {
+            manualCrop.first
+        } else {
+            focusRoi(laneBitmap, source, logDetails = true)
+        }
+        val strategy = if (manualCrop != null) "manual_roi" else "center_crop"
+        val compared = Bitmap.createScaledBitmap(cropped, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
+        if (manualCrop != null) {
+            Log.d(
+                TAG,
+                "ROI strategy=manual_roi lane=${laneBitmap.width}x${laneBitmap.height} roiPx=${manualCrop.second} compared=${compared.width}x${compared.height}"
             )
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error calculating color-aware similarity", e)
+        }
+        return ExtractionResult(
+            laneBitmap = laneBitmap,
+            comparisonBitmap = compared,
+            strategy = strategy,
+            roiRectPx = manualCrop?.second
+        )
+    }
+
+    private fun cropByNormalized(
+        laneBitmap: Bitmap,
+        roi: TemplateStorage.ManualRoi
+    ): Pair<Bitmap, RoiRectPx>? {
+        if (!roi.isValid()) return null
+        val left = (roi.leftNorm * laneBitmap.width).toInt().coerceIn(0, laneBitmap.width - 1)
+        val top = (roi.topNorm * laneBitmap.height).toInt().coerceIn(0, laneBitmap.height - 1)
+        val right = (roi.rightNorm * laneBitmap.width).toInt().coerceIn(left + 1, laneBitmap.width)
+        val bottom = (roi.bottomNorm * laneBitmap.height).toInt().coerceIn(top + 1, laneBitmap.height)
+        val width = right - left
+        val height = bottom - top
+        if (width <= 0 || height <= 0) return null
+        val cropped = Bitmap.createBitmap(laneBitmap, left, top, width, height)
+        return cropped to RoiRectPx(left, top, right, bottom)
+    }
+
+    private fun calculateVisualSimilarity(bitmap1: Bitmap, bitmap2: Bitmap): VisualSimilarity {
+        if (bitmap1.width != bitmap2.width || bitmap1.height != bitmap2.height) {
+            Log.w(TAG, "Bitmap dimensions mismatch: ${bitmap1.width}x${bitmap1.height} vs ${bitmap2.width}x${bitmap2.height}")
             return VisualSimilarity(0f, 0f, 0f)
         }
+
+        var structuralDiffSum = 0f
+        var colorDiffSum = 0f
+        var totalWeight = 0f
+
+        for (y in 0 until bitmap1.height step 4) {
+            for (x in 0 until bitmap1.width step 4) {
+                val p1 = bitmap1.getPixel(x, y)
+                val p2 = bitmap2.getPixel(x, y)
+
+                val r1 = ((p1 shr 16) and 0xFF).toFloat()
+                val g1 = ((p1 shr 8) and 0xFF).toFloat()
+                val b1 = (p1 and 0xFF).toFloat()
+                val r2 = ((p2 shr 16) and 0xFF).toFloat()
+                val g2 = ((p2 shr 8) and 0xFF).toFloat()
+                val b2 = (p2 and 0xFF).toFloat()
+
+                val lum1 = (0.299f * r1) + (0.587f * g1) + (0.114f * b1)
+                val lum2 = (0.299f * r2) + (0.587f * g2) + (0.114f * b2)
+                val structuralDiff = abs(lum1 - lum2) / 255f
+
+                val sum1 = (r1 + g1 + b1).coerceAtLeast(1f)
+                val sum2 = (r2 + g2 + b2).coerceAtLeast(1f)
+                val chromaDiff = (
+                    abs((r1 / sum1) - (r2 / sum2)) +
+                        abs((g1 / sum1) - (g2 / sum2)) +
+                        abs((b1 / sum1) - (b2 / sum2))
+                    ) / 3f
+
+                val sat1 = calculateSaturation(r1, g1, b1)
+                val sat2 = calculateSaturation(r2, g2, b2)
+                val saturationDiff = abs(sat1 - sat2)
+                val colorDiff = ((chromaDiff * 0.8f) + (saturationDiff * 0.2f)).coerceIn(0f, 1f)
+
+                val backgroundWeight = min(
+                    computeBackgroundWeight(lum1, sat1),
+                    computeBackgroundWeight(lum2, sat2)
+                )
+
+                structuralDiffSum += structuralDiff * backgroundWeight
+                colorDiffSum += colorDiff * backgroundWeight
+                totalWeight += backgroundWeight
+            }
+        }
+
+        if (totalWeight <= 0f) return VisualSimilarity(0f, 0f, 0f)
+
+        val structuralSimilarity = (1f - (structuralDiffSum / totalWeight)).coerceIn(0f, 1f)
+        val colorSimilarity = (1f - (colorDiffSum / totalWeight)).coerceIn(0f, 1f)
+        val combined = ((structuralSimilarity * STRUCTURAL_WEIGHT) + (colorSimilarity * COLOR_WEIGHT)).coerceIn(0f, 1f)
+        return VisualSimilarity(structuralSimilarity, colorSimilarity, combined)
+    }
+
+    private fun calculateSaturation(r: Float, g: Float, b: Float): Float {
+        val maxChannel = max(r, max(g, b))
+        val minChannel = min(r, min(g, b))
+        return if (maxChannel <= 0f) 0f else (maxChannel - minChannel) / maxChannel
+    }
+
+    private fun computeBackgroundWeight(luminance: Float, saturation: Float): Float {
+        val lumNorm = (luminance / 255f).coerceIn(0f, 1f)
+        val isNeutral = saturation < 0.12f
+        val isVeryBright = lumNorm > 0.78f
+        val isVeryDark = lumNorm < 0.22f
+        return if (isNeutral && (isVeryBright || isVeryDark)) BACKGROUND_LOW_WEIGHT else 1f
     }
 
     private fun focusRoi(input: Bitmap, source: String, logDetails: Boolean): Bitmap {
-        if (!MonitoringMode.focusedSubRoiEnabled) {
-            return input
-        }
-
+        if (!MonitoringMode.focusedSubRoiEnabled) return input
         val focused = ImageUtils.cropCenteredByRatio(
             input,
             MonitoringMode.focusedSubRoiWidthRatio,
             MonitoringMode.focusedSubRoiHeightRatio
-        )
-
-        if (focused == null) {
-            if (logDetails) {
-                Log.w(
-                    TAG,
-                    "ROI focus fallback source=$source strategy=center_crop laneRoi=${input.width}x${input.height} (invalid subROI)"
-                )
-            }
-            return input
-        }
+        ) ?: return input
 
         if (logDetails) {
             Log.d(

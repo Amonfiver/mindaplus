@@ -27,6 +27,10 @@ object MonitoringMode {
     const val focusedSubRoiWidthRatio: Float = 0.52f
     const val focusedSubRoiHeightRatio: Float = 0.72f
 
+    // Manager/superuser tooling flags (temporary in development).
+    const val managerToolsEnabled: Boolean = true
+    const val debugPanelEnabled: Boolean = managerToolsEnabled
+
     fun isTransferEnabled(transferId: Int): Boolean = transferId in enabledTransfers
     fun isStateEnabled(state: TransferState): Boolean = state in enabledTrainingStates
 }

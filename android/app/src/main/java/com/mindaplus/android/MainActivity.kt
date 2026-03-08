@@ -9,12 +9,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -42,6 +44,7 @@ class MainActivity : ComponentActivity() {
     private var isTrained by mutableStateOf(false)
     private var trainingProgress by mutableStateOf(0 to (MonitoringMode.enabledTransfers.size * MonitoringMode.enabledTrainingStates.size).coerceAtLeast(1))
     private var totalTrainingSamples by mutableStateOf(0)
+    private var debugSnapshot by mutableStateOf<TemplateClassifier.DebugSnapshot?>(null)
     
     // 5-second throttle mechanism
     private var lastAnalysisTime = 0L
@@ -175,6 +178,9 @@ class MainActivity : ComponentActivity() {
                 
                 // Update UI state
                 transferStates = newStates
+                if (MonitoringMode.debugPanelEnabled) {
+                    debugSnapshot = transferMonitor.getLatestDebugSnapshot(100)
+                }
                 
             } catch (e: Exception) {
                 Log.e("Mindaplus", "MainActivity: Error analyzing camera frame", e)
@@ -397,6 +403,10 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+
+                if (MonitoringMode.debugPanelEnabled) {
+                    DebugPanel()
+                }
                 
                 Spacer(modifier = Modifier.weight(1f))
                 
@@ -414,6 +424,73 @@ class MainActivity : ComponentActivity() {
                             color = if (isMonitoring) Color.Green else Color.Red,
                             fontWeight = FontWeight.Bold
                         )
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun DebugPanel() {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Debug VIGIA (Gestor)",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                val snapshot = debugSnapshot
+                if (snapshot == null) {
+                    Text("Sin snapshot de depuración todavía.")
+                } else {
+                    Text("Transfer: T${snapshot.transferId}")
+                    Text("Estrategia ROI: ${snapshot.strategy}")
+                    Text("ROI guardada px: ${snapshot.roiRectPx ?: "n/a"}")
+                    Text("Veredicto: ${snapshot.finalState.displayName} (${snapshot.finalReason}) score=${"%.4f".format(snapshot.finalScore)}")
+
+                    snapshot.stateDebug[TransferState.OK]?.let { ok ->
+                        Text("OK -> visual=${"%.4f".format(ok.bestVisual)} structural=${"%.4f".format(ok.bestStructural)} color=${"%.4f".format(ok.bestColor)} spatial=${"%.4f".format(ok.bestSpatial)} final=${"%.4f".format(ok.laneAdjusted)}")
+                    }
+                    snapshot.stateDebug[TransferState.OBSTACULO]?.let { obst ->
+                        Text("OBST -> visual=${"%.4f".format(obst.bestVisual)} structural=${"%.4f".format(obst.bestStructural)} color=${"%.4f".format(obst.bestColor)} spatial=${"%.4f".format(obst.bestSpatial)} final=${"%.4f".format(obst.laneAdjusted)}")
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Lane actual", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                            Image(bitmap = snapshot.laneBitmap.asImageBitmap(), contentDescription = "Lane", modifier = Modifier.fillMaxWidth().height(90.dp))
+                        }
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Recorte comparado", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                            Image(bitmap = snapshot.comparedBitmap.asImageBitmap(), contentDescription = "Compared", modifier = Modifier.fillMaxWidth().height(90.dp))
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        snapshot.okReference?.let {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("Referencia OK", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                Image(bitmap = it.asImageBitmap(), contentDescription = "OK ref", modifier = Modifier.fillMaxWidth().height(90.dp))
+                            }
+                        }
+                        snapshot.obstaculoReference?.let {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("Referencia OBST", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                Image(bitmap = it.asImageBitmap(), contentDescription = "OBST ref", modifier = Modifier.fillMaxWidth().height(90.dp))
+                            }
+                        }
                     }
                 }
             }
