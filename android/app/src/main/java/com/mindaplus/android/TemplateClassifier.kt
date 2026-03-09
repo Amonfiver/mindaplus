@@ -8,6 +8,12 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
+/**
+ * Classifier that compares current ROI against stored templates using visual and spatial similarity.
+ * Uses unified geometric canonization pipeline: both current frame and reference templates
+ * pass through the same temporal focus + resize transformation before comparison.
+ * This ensures geometric consistency regardless of how templates were originally captured.
+ */
 class TemplateClassifier(private val templateStorage: TemplateStorage) {
     companion object {
         private const val TAG = "TemplateClassifier"
@@ -183,8 +189,13 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         for (state in enabledStates) {
             val samples = templateStorage.loadTemplateSamples(transferId, state)
             if (samples.isEmpty()) continue
-            if (state == TransferState.OK && okReference == null) okReference = samples.first().bitmap
-            if (state == TransferState.OBSTACULO && obstReference == null) obstReference = samples.first().bitmap
+            // Store canonized versions for debug to show what is actually being compared
+            if (state == TransferState.OK && okReference == null) {
+                okReference = samples.first().bitmap?.let { canonizeForComparison(it) }
+            }
+            if (state == TransferState.OBSTACULO && obstReference == null) {
+                obstReference = samples.first().bitmap?.let { canonizeForComparison(it) }
+            }
 
             var withSpatialCount = 0
             val perSampleScores = samples.map { sample ->
@@ -306,18 +317,19 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         )
     }
 
+    /**
+     * Calculates visual similarity using unified geometric canonization.
+     * Both current frame and template pass through the same pipeline (focus + resize)
+     * before comparison, ensuring geometric consistency.
+     */
     private fun calculateVisualSimilarityWithTemplateFallback(
         currentRoi: Bitmap,
         templateBitmap: Bitmap
     ): VisualSimilarity {
-        val asIs = calculateVisualSimilarity(currentRoi, templateBitmap)
-        val focusedTemplate = if (MonitoringMode.focusedSubRoiEnabled) {
-            focusRoi(templateBitmap, "template", logDetails = false)
-        } else {
-            null
-        }
-        val focusedScore = focusedTemplate?.let { calculateVisualSimilarity(currentRoi, it) } ?: asIs
-        return if (focusedScore.combined >= asIs.combined) focusedScore else asIs
+        // Unified pipeline: both images canonized with same geometric transformation
+        val currentCanonized = canonizeForComparison(currentRoi)
+        val templateCanonized = canonizeForComparison(templateBitmap)
+        return calculateVisualSimilarity(currentCanonized, templateCanonized)
     }
 
     private fun computeTransferLaneCoherence(context: SpatialContext): Float {
@@ -423,27 +435,60 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         return buildExtraction(transferId, laneBitmap, "current_yuv")
     }
 
-    private fun buildExtraction(transferId: Int, laneBitmap: Bitmap, source: String): ExtractionResult {
-        val manual = templateStorage.loadManualRoi(transferId)
-        val manualCrop = manual?.let { cropByNormalized(laneBitmap, it) }
-        val cropped = if (manualCrop != null) {
-            manualCrop.first
+    /**
+     * Canonizes a bitmap for visual comparison by applying the same geometric transformation
+     * used for both current frames and reference templates.
+     * Pipeline: focusRoi (temporal center crop) -> resize to template dimensions
+     */
+    private fun canonizeForComparison(bitmap: Bitmap): Bitmap {
+        val focused = if (MonitoringMode.focusedSubRoiEnabled) {
+            ImageUtils.cropCenteredByRatio(
+                bitmap,
+                MonitoringMode.focusedSubRoiWidthRatio,
+                MonitoringMode.focusedSubRoiHeightRatio
+            ) ?: bitmap
         } else {
-            focusRoi(laneBitmap, source, logDetails = true)
+            bitmap
         }
-        val strategy = if (manualCrop != null) "manual_roi" else "center_crop"
-        val compared = Bitmap.createScaledBitmap(cropped, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
-        if (manualCrop != null) {
-            Log.d(
-                TAG,
-                "ROI strategy=manual_roi lane=${laneBitmap.width}x${laneBitmap.height} roiPx=${manualCrop.second} compared=${compared.width}x${compared.height}"
-            )
+        return Bitmap.createScaledBitmap(focused, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
+    }
+
+    /**
+     * Calculates the pixel coordinates of the focused ROI for debug visualization.
+     * Mirrors the logic in ImageUtils.cropCenteredByRatio.
+     */
+    private fun calculateFocusRoiRect(bitmap: Bitmap): RoiRectPx {
+        val cropWidth = (bitmap.width * MonitoringMode.focusedSubRoiWidthRatio).toInt()
+            .coerceIn(1, bitmap.width)
+        val cropHeight = (bitmap.height * MonitoringMode.focusedSubRoiHeightRatio).toInt()
+            .coerceIn(1, bitmap.height)
+        val left = (bitmap.width - cropWidth) / 2
+        val top = (bitmap.height - cropHeight) / 2
+        return RoiRectPx(left, top, left + cropWidth, top + cropHeight)
+    }
+
+    private fun buildExtraction(transferId: Int, laneBitmap: Bitmap, source: String): ExtractionResult {
+        // Temporal canonization pipeline: lane -> focusRoi -> resize
+        // Both current frame and templates use this same pipeline for geometric consistency
+        val canonized = canonizeForComparison(laneBitmap)
+        
+        // Calculate ROI rect for debug visualization (focused region before resize)
+        val roiRectPx = if (MonitoringMode.focusedSubRoiEnabled) {
+            calculateFocusRoiRect(laneBitmap)
+        } else {
+            RoiRectPx(0, 0, laneBitmap.width, laneBitmap.height)
         }
+        
+        Log.d(
+            TAG,
+            "ROI strategy=temporal_canonization lane=${laneBitmap.width}x${laneBitmap.height} roiPx=$roiRectPx canonized=${canonized.width}x${canonized.height}"
+        )
+        
         return ExtractionResult(
             laneBitmap = laneBitmap,
-            comparisonBitmap = compared,
-            strategy = strategy,
-            roiRectPx = manualCrop?.second
+            comparisonBitmap = canonized,
+            strategy = "temporal_canonization",
+            roiRectPx = roiRectPx
         )
     }
 
