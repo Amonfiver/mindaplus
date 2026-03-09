@@ -1,3 +1,21 @@
+/**
+ * TrainingActivity.kt - UI de captura de muestras maestras para entrenamiento
+ *
+ * Propósito: Interfaz de usuario para capturar y guardar muestras de referencia
+ *            de los diferentes estados de los transfers (OK, OBSTACULO).
+ *
+ * Alcance: Lógica de captura simplificada - solo lane completa, sin ROI manual.
+ *          La muestra capturada es la lane completa detectada.
+ *
+ * Modo temporal activo: T100 únicamente, estados OK y OBSTACULO habilitados.
+ *                       FALLO desactivado. ROI manual persistente desactivado.
+ *
+ * Cambios recientes (SDD):
+ *   - Eliminado bloque visible "Calibración ROI Manual (Gestor)"
+ *   - Renombrados textos: plantilla -> muestra maestra, Template Captured, etc.
+ *   - captureTemplate() ya no usa ROI manual persistente, solo lane completa
+ */
+
 package com.mindaplus.android
 
 import android.graphics.Bitmap
@@ -245,113 +263,6 @@ class TrainingActivity : ComponentActivity() {
                     }
                 }
                 
-                // State Selection
-                if (MonitoringMode.managerToolsEnabled) {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text(
-                                text = "Calibración ROI Manual (Gestor)",
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "Captura lane completa y dibuja el rectángulo útil del transfer.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray
-                            )
-                            Text(
-                                text = "ROI guardada: ${manualRoi?.let { "(${String.format("%.3f", it.leftNorm)}, ${String.format("%.3f", it.topNorm)}) - (${String.format("%.3f", it.rightNorm)}, ${String.format("%.3f", it.bottomNorm)})" } ?: "no calibrada"}",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                OutlinedButton(
-                                    onClick = { captureLaneForCalibration() },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("Capturar lane")
-                                }
-                                OutlinedButton(
-                                    onClick = { saveManualRoiFromSelection() },
-                                    modifier = Modifier.weight(1f),
-                                    enabled = calibrationLaneBitmap != null && calibrationStart != null && calibrationEnd != null
-                                ) {
-                                    Text("Guardar ROI")
-                                }
-                            }
-
-                            calibrationLaneBitmap?.let { laneBmp ->
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(180.dp)
-                                ) {
-                                    Image(
-                                        bitmap = laneBmp.asImageBitmap(),
-                                        contentDescription = "Lane calibration",
-                                        modifier = Modifier.fillMaxSize(),
-                                        contentScale = ContentScale.Fit
-                                    )
-                                    Canvas(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .onSizeChanged { calibrationCanvasSize = it }
-                                            .pointerInput(laneBmp) {
-                                                detectDragGestures(
-                                                    onDragStart = { offset ->
-                                                        calibrationStart = offset
-                                                        calibrationEnd = offset
-                                                    },
-                                                    onDrag = { change, _ ->
-                                                        calibrationEnd = change.position
-                                                    }
-                                                )
-                                            }
-                                    ) {
-                                        val mapping = ImageUtils.computeFitDisplayMapping(
-                                            viewWidth = size.width.toInt(),
-                                            viewHeight = size.height.toInt(),
-                                            bitmapWidth = laneBmp.width,
-                                            bitmapHeight = laneBmp.height
-                                        )
-
-                                        drawRect(
-                                            color = Color.White.copy(alpha = 0.08f),
-                                            topLeft = Offset(mapping.offsetX, mapping.offsetY),
-                                            size = Size(mapping.drawnWidth, mapping.drawnHeight),
-                                            style = Stroke(width = 1f)
-                                        )
-
-                                        val start = calibrationStart
-                                        val end = calibrationEnd
-                                        if (start != null && end != null) {
-                                            val left = min(start.x, end.x)
-                                            val top = min(start.y, end.y)
-                                            val right = max(start.x, end.x)
-                                            val bottom = max(start.y, end.y)
-                                            drawRect(
-                                                color = Color.Red,
-                                                topLeft = Offset(left, top),
-                                                size = Size(right - left, bottom - top),
-                                                style = Stroke(width = 3f)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
@@ -361,7 +272,7 @@ class TrainingActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            text = "Estado Manual de la Plantilla",
+                            text = "Estado manual de la muestra maestra",
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold
                         )
@@ -449,7 +360,7 @@ class TrainingActivity : ComponentActivity() {
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = "Template Captured",
+                                text = "Muestra maestra capturada",
                                 style = MaterialTheme.typography.headlineSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.Green
@@ -489,7 +400,7 @@ class TrainingActivity : ComponentActivity() {
                         modifier = Modifier.weight(1f),
                         enabled = !isCapturing && selectedState != TransferState.UNKNOWN
                     ) {
-                        Text("Capturar plantilla")
+                        Text("Capturar muestra maestra")
                     }
                     
                     Button(
@@ -499,7 +410,7 @@ class TrainingActivity : ComponentActivity() {
                                  lastCapturedTransfer == selectedTransfer && 
                                  lastCapturedState == selectedState
                     ) {
-                        Text("Guardar")
+                        Text("Guardar muestra")
                     }
                 }
                 
@@ -621,7 +532,7 @@ class TrainingActivity : ComponentActivity() {
                 val targetLane = lanes[targetLaneIndex]
                 Log.d(TAG, "Selected lane $targetLaneIndex for T$selectedTransfer: $targetLane")
                 
-                // Step 3: Crop bitmap to the detected lane region
+                // Step 3: Crop bitmap to the detected lane region (solo lane completa, sin ROI manual)
                 val laneBitmap = ImageUtils.cropBitmap(bitmap, targetLane.left, targetLane.top, targetLane.right, targetLane.bottom)
                 if (laneBitmap == null) {
                     Log.e(TAG, "Failed to crop bitmap to lane region")
@@ -630,22 +541,12 @@ class TrainingActivity : ComponentActivity() {
                     return@launch
                 }
 
-                val manualForTransfer = transferMonitor.getManualRoi(selectedTransfer)
-                val focusedBitmap = manualForTransfer?.let { cropManualRoiFromLane(laneBitmap, it) } ?: run {
-                    if (MonitoringMode.focusedSubRoiEnabled) {
-                        ImageUtils.cropCenteredByRatio(
-                            laneBitmap,
-                            MonitoringMode.focusedSubRoiWidthRatio,
-                            MonitoringMode.focusedSubRoiHeightRatio
-                        ) ?: laneBitmap
-                    } else {
-                        laneBitmap
-                    }
-                }
+                // Modo simplificado: usar lane completa como muestra, sin ROI manual persistente
+                val focusedBitmap = laneBitmap
                 
                 Log.d(
                     TAG,
-                    "Template capture ROI strategy=${if (manualForTransfer != null) "manual_roi" else if (MonitoringMode.focusedSubRoiEnabled) "center_crop" else "full_lane"} laneRoi=${laneBitmap.width}x${laneBitmap.height} subRoi=${focusedBitmap.width}x${focusedBitmap.height} ratios=${MonitoringMode.focusedSubRoiWidthRatio}x${MonitoringMode.focusedSubRoiHeightRatio}"
+                    "Muestra capturada (modo simplificado): laneCompleta=${laneBitmap.width}x${laneBitmap.height}"
                 )
                 
                 // Step 4: Store the cropped template for preview (NO guardar todavía)
