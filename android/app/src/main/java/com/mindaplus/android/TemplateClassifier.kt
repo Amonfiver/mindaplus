@@ -25,7 +25,7 @@
  *   4. Comparar esa ventana contra la muestra maestra (ROI 2)
  *
  * Cambios recientes (SDD - ROI Dual):
- *   - Implementada localización por correlación normalizada en Search ROI
+ *   - Localización por similitud real contra bitmap maestro (no varianza)
  *   - Eliminado center crop como estrategia principal
  *   - Nuevo sistema de debug con visualización de ROIs
  */
@@ -492,7 +492,8 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
      * Extracción usando sistema ROI dual:
      * 1. Aplicar Search ROI (ROI 1) a la lane actual
      * 2. Buscar dentro del Search ROI una ventana del tamaño de Master ROI
-     * 3. Devolver esa ventana como currentWindow
+     * 3. Comparar cada ventana candidata contra el bitmap maestro real
+     * 4. Devolver la ventana con mayor similitud como currentWindow
      */
     private fun extractWithDualRoi(
         laneBitmap: Bitmap,
@@ -520,8 +521,17 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         val windowWidth = masterRoi.width
         val windowHeight = masterRoi.height
         
-        // Buscar la ventana más similar dentro del Search ROI
-        val locatedWindow = locateBestWindow(searchBitmap, windowWidth, windowHeight)
+        // Extraer el bitmap maestro de referencia (ROI 2)
+        val masterBitmap = Bitmap.createBitmap(
+            laneBitmap,
+            masterRoi.left.coerceIn(0, laneBitmap.width - 1),
+            masterRoi.top.coerceIn(0, laneBitmap.height - 1),
+            masterRoi.width.coerceIn(1, laneBitmap.width - masterRoi.left),
+            masterRoi.height.coerceIn(1, laneBitmap.height - masterRoi.top)
+        )
+        
+        // Buscar la ventana más similar al bitmap maestro dentro del Search ROI
+        val locatedWindow = locateBestWindow(searchBitmap, windowWidth, windowHeight, masterBitmap)
         
         Log.d(
             TAG,
@@ -570,15 +580,20 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
     }
 
     /**
-     * Localiza la mejor ventana dentro de searchBitmap del tamaño especificado
-     * usando búsqueda por correlación simple (versión eficiente)
+     * Localiza la mejor ventana dentro de searchBitmap comparando contra masterBitmap.
+     * Usa similitud visual real (no varianza) para encontrar la región más parecida.
      * 
+     * @param searchBitmap Bitmap del área de búsqueda (ROI 1)
+     * @param windowWidth Ancho de la ventana a buscar (tamaño master)
+     * @param windowHeight Alto de la ventana a buscar (tamaño master)
+     * @param masterBitmap Bitmap maestro de referencia (ROI 2) para comparación
      * @return Triple<similarity, rectLocated, windowBitmap>
      */
     private fun locateBestWindow(
         searchBitmap: Bitmap,
         windowWidth: Int,
-        windowHeight: Int
+        windowHeight: Int,
+        masterBitmap: Bitmap
     ): Triple<Float, RoiRectPx, Bitmap> {
         if (windowWidth >= searchBitmap.width || windowHeight >= searchBitmap.height) {
             // La ventana es más grande que el área de búsqueda, usar centro
@@ -587,7 +602,9 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
             val left = (centerX - windowWidth / 2).coerceIn(0, searchBitmap.width - windowWidth)
             val top = (centerY - windowHeight / 2).coerceIn(0, searchBitmap.height - windowHeight)
             val bitmap = Bitmap.createBitmap(searchBitmap, left, top, windowWidth, windowHeight)
-            return Triple(0.5f, RoiRectPx(left, top, left + windowWidth, top + windowHeight), bitmap)
+            // Calcular similitud real para el fallback de centro
+            val similarity = calculateQuickSimilarity(bitmap, masterBitmap)
+            return Triple(similarity, RoiRectPx(left, top, left + windowWidth, top + windowHeight), bitmap)
         }
 
         var bestSimilarity = -1f
@@ -598,17 +615,15 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         val maxLeft = searchBitmap.width - windowWidth
         val maxTop = searchBitmap.height - windowHeight
         
-        // Usar paso más grande para velocidad, refinamiento opcional
-        val stepX = max(SEARCH_STEP_SIZE, maxLeft / 20)
-        val stepY = max(SEARCH_STEP_SIZE, maxTop / 20)
+        // Usar paso más grande para velocidad
+        val stepX = max(SEARCH_STEP_SIZE, maxLeft / 20).coerceAtLeast(2)
+        val stepY = max(SEARCH_STEP_SIZE, maxTop / 20).coerceAtLeast(2)
         
-        // Calcular promedio de la ventana de referencia (esquema simplificado)
-        // En una implementación completa, compararíamos contra el template real
-        // Aquí buscamos la región con mejor "estructura" (variación de intensidad)
-        
+        // Primera pasada: búsqueda gruesa con paso grande
         for (y in 0..maxTop step stepY) {
             for (x in 0..maxLeft step stepX) {
-                val similarity = calculateRegionScore(searchBitmap, x, y, windowWidth, windowHeight)
+                val candidate = Bitmap.createBitmap(searchBitmap, x, y, windowWidth, windowHeight)
+                val similarity = calculateQuickSimilarity(candidate, masterBitmap)
                 if (similarity > bestSimilarity) {
                     bestSimilarity = similarity
                     bestLeft = x
@@ -617,11 +632,15 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
             }
         }
         
-        // Refinar en vecindad del mejor punto (búsqueda fina ±step)
+        // Segunda pasada: refinamiento en vecindad del mejor punto
         val refineRange = stepX / 2
         for (y in max(0, bestTop - refineRange)..min(maxTop, bestTop + refineRange)) {
             for (x in max(0, bestLeft - refineRange)..min(maxLeft, bestLeft + refineRange)) {
-                val similarity = calculateRegionScore(searchBitmap, x, y, windowWidth, windowHeight)
+                // Evitar recalcular la misma posición
+                if ((x - bestLeft) % stepX == 0 && (y - bestTop) % stepY == 0) continue
+                
+                val candidate = Bitmap.createBitmap(searchBitmap, x, y, windowWidth, windowHeight)
+                val similarity = calculateQuickSimilarity(candidate, masterBitmap)
                 if (similarity > bestSimilarity) {
                     bestSimilarity = similarity
                     bestLeft = x
@@ -631,59 +650,54 @@ class TemplateClassifier(private val templateStorage: TemplateStorage) {
         }
         
         val windowBitmap = Bitmap.createBitmap(searchBitmap, bestLeft, bestTop, windowWidth, windowHeight)
-        val normalizedSimilarity = (bestSimilarity / 255f).coerceIn(0f, 1f)
+        
+        Log.d(TAG, "locateBestWindow: bestSim=${"%.4f".format(bestSimilarity)} at ($bestLeft,$bestTop)")
         
         return Triple(
-            normalizedSimilarity,
+            bestSimilarity,
             RoiRectPx(bestLeft, bestTop, bestLeft + windowWidth, bestTop + windowHeight),
             windowBitmap
         )
     }
 
     /**
-     * Calcula un score para una región (mayor = más "interesante"/estructurada)
-     * Versión simplificada: varianza de luminancia local
+     * Calcula similitud visual rápida entre dos bitmaps del mismo tamaño.
+     * Versión optimizada de calculateVisualSimilarity para búsqueda.
      */
-    private fun calculateRegionScore(
-        bitmap: Bitmap,
-        left: Int,
-        top: Int,
-        width: Int,
-        height: Int
-    ): Float {
-        var sum = 0f
-        var sumSq = 0f
+    private fun calculateQuickSimilarity(bitmap1: Bitmap, bitmap2: Bitmap): Float {
+        if (bitmap1.width != bitmap2.width || bitmap1.height != bitmap2.height) {
+            return 0f
+        }
+
+        var diffSum = 0f
         var count = 0
         
         // Muestreo cada 4 píxeles para velocidad
-        for (y in top until min(top + height, bitmap.height) step 4) {
-            for (x in left until min(left + width, bitmap.width) step 4) {
-                val pixel = bitmap.getPixel(x, y)
-                val r = ((pixel shr 16) and 0xFF).toFloat()
-                val g = ((pixel shr 8) and 0xFF).toFloat()
-                val b = (pixel and 0xFF).toFloat()
-                val lum = 0.299f * r + 0.587f * g + 0.114f * b
-                sum += lum
-                sumSq += lum * lum
+        for (y in 0 until bitmap1.height step 4) {
+            for (x in 0 until bitmap1.width step 4) {
+                val p1 = bitmap1.getPixel(x, y)
+                val p2 = bitmap2.getPixel(x, y)
+
+                val r1 = ((p1 shr 16) and 0xFF).toFloat()
+                val g1 = ((p1 shr 8) and 0xFF).toFloat()
+                val b1 = (p1 and 0xFF).toFloat()
+                val r2 = ((p2 shr 16) and 0xFF).toFloat()
+                val g2 = ((p2 shr 8) and 0xFF).toFloat()
+                val b2 = (p2 and 0xFF).toFloat()
+
+                // Diferencia euclídea normalizada (0-1)
+                val diff = kotlin.math.sqrt(
+                    ((r1-r2)*(r1-r2) + (g1-g2)*(g1-g2) + (b1-b2)*(b1-b2)) / (3f * 255f * 255f)
+                )
+                diffSum += diff
                 count++
             }
         }
-        
+
         if (count == 0) return 0f
         
-        val mean = sum / count
-        val variance = (sumSq / count) - (mean * mean)
-        
-        // Score: combinación de varianza (estructura) y distancia al centro (preferencia central)
-        val centerX = bitmap.width / 2f
-        val centerY = bitmap.height / 2f
-        val regionCenterX = left + width / 2f
-        val regionCenterY = top + height / 2f
-        val distToCenter = kotlin.math.hypot(regionCenterX - centerX, regionCenterY - centerY)
-        val maxDist = kotlin.math.hypot(bitmap.width / 2f, bitmap.height / 2f)
-        val centerBonus = 1f - (distToCenter / maxDist).coerceIn(0f, 1f) * 0.3f
-        
-        return variance * centerBonus
+        // Convertir a similitud (1 = idéntico, 0 = completamente diferente)
+        return (1f - (diffSum / count)).coerceIn(0f, 1f)
     }
 
     private fun computeTransferLaneCoherence(context: SpatialContext): Float {
