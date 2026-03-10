@@ -1,3 +1,28 @@
+/**
+ * TemplateStorage.kt - Persistencia de muestras maestras y metadatos espaciales ROI dual
+ *
+ * Propósito: Guardar y cargar templates de referencia para clasificación de estados
+ *            de transfers (OK, OBSTACULO) con sistema ROI dual.
+ *
+ * Alcance: 
+ *   - Almacenamiento de imágenes PNG en filesDir/templates/
+ *   - Metadatos espaciales ROI dual: Search ROI (ROI 1) + Master ROI (ROI 2)
+ *   - Compatibilidad backward con muestras legacy (center crop)
+ *
+ * Modo temporal activo: T100 + OK/OBSTACULO
+ *   - FALLO desactivado
+ *   - T200/T300 desactivados
+ *
+ * Sistema ROI Dual:
+ *   - ROI 1 (searchRoi): Zona de búsqueda dentro de la lane donde buscar el transfer
+ *   - ROI 2 (masterRoi): Muestra maestra exacta del transfer (tamaño/forma objetivo)
+ *   - En runtime: se busca dentro de ROI 1 una ventana del tamaño de ROI 2
+ *
+ * Cambios recientes (SDD - ROI Dual):
+ *   - SpatialMetadata extendido con searchRoi y masterRoi
+ *   - Eliminada dependencia de center crop como método principal
+ *   - Fallback legacy para muestras sin ROI dual
+ */
 package com.mindaplus.android
 
 import android.content.Context
@@ -15,40 +40,96 @@ class TemplateStorage(private val context: Context) {
         private const val TEMPLATES_DIR = "templates"
         private const val MANIFEST_FILE = "manifest.json"
         private const val ROI_CALIBRATION_FILE = "roi_calibration.json"
-        private const val TEMPLATE_VERSION = "0.4"
-        private const val SPATIAL_METADATA_VERSION = 1
+        private const val TEMPLATE_VERSION = "0.5" // Actualizado para ROI dual
+        private const val SPATIAL_METADATA_VERSION = 2 // v2 = ROI dual
         private const val TEMPLATE_WIDTH = 128
         private const val TEMPLATE_HEIGHT = 64
         private val TRAINING_TRANSFERS = MonitoringMode.enabledTransfers
         private val TRAINING_STATES = MonitoringMode.enabledTrainingStates
     }
 
-    data class SpatialMetadata(
+    /**
+     * ROI específico con coordenadas absolutas
+     */
+    data class RoiRect(
         val left: Int,
         val top: Int,
         val right: Int,
-        val bottom: Int,
+        val bottom: Int
+    ) {
+        val width: Int get() = right - left
+        val height: Int get() = bottom - top
+        val isValid: Boolean get() = left >= 0 && top >= 0 && right > left && bottom > top
+        
+        companion object {
+            fun fromNormalized(
+                leftNorm: Float, topNorm: Float, rightNorm: Float, bottomNorm: Float,
+                parentWidth: Int, parentHeight: Int
+            ): RoiRect {
+                return RoiRect(
+                    left = (leftNorm * parentWidth).toInt().coerceIn(0, parentWidth - 1),
+                    top = (topNorm * parentHeight).toInt().coerceIn(0, parentHeight - 1),
+                    right = (rightNorm * parentWidth).toInt().coerceIn(1, parentWidth),
+                    bottom = (bottomNorm * parentHeight).toInt().coerceIn(1, parentHeight)
+                )
+            }
+        }
+    }
+
+    /**
+     * Metadatos espaciales ROI dual
+     * 
+     * @param laneRoi Región de la lane detectada en coordenadas del frame original (ROI 1 contenedor)
+     * @param searchRoi ROI 1: Zona de búsqueda dentro de la lane (relativo a laneRoi)
+     * @param masterRoi ROI 2: Muestra maestra exacta (relativo a laneRoi)
+     */
+    data class SpatialMetadata(
+        val laneRoi: RoiRect,           // Lane completa en coordenadas frame
+        val searchRoi: RoiRect?,        // ROI 1: zona de búsqueda (relativo a lane)
+        val masterRoi: RoiRect?,        // ROI 2: muestra maestra (relativo a lane)
         val frameWidth: Int,
         val frameHeight: Int
     ) {
-        val roiHeight: Int
-            get() = (bottom - top).coerceAtLeast(1)
-
-        val centerY: Float
-            get() = (top + bottom) / 2f
-
+        /**
+         * Verifica si tiene ROI dual completo (search + master)
+         */
+        val hasDualRoi: Boolean
+            get() = searchRoi?.isValid == true && masterRoi?.isValid == true
+        
+        /**
+         * Fallback legacy: solo lane ROI sin ROIs específicas
+         */
+        val isLegacy: Boolean
+            get() = !hasDualRoi
+        
+        /**
+         * Centro Y normalizado de la lane (para compatibilidad spatial antiguo)
+         */
         val centerYNorm: Float
-            get() = if (frameHeight > 0) centerY / frameHeight.toFloat() else 0f
-
-        val roiHeightNorm: Float
-            get() = if (frameHeight > 0) roiHeight / frameHeight.toFloat() else 0f
+            get() = if (frameHeight > 0) (laneRoi.top + laneRoi.bottom) / 2f / frameHeight else 0f
+        
+        /**
+         * Altura de lane normalizada
+         */
+        val laneHeightNorm: Float
+            get() = if (frameHeight > 0) laneRoi.height.toFloat() / frameHeight else 0f
     }
 
     data class TemplateSample(
         val fileName: String,
         val bitmap: Bitmap,
         val spatialMetadata: SpatialMetadata?
-    )
+    ) {
+        /**
+         * Estrategia de comparación recomendada para esta muestra
+         */
+        val comparisonStrategy: String
+            get() = when {
+                spatialMetadata?.hasDualRoi == true -> "dual_roi"
+                spatialMetadata != null -> "lane_only"
+                else -> "legacy"
+            }
+    }
 
     data class ManualRoi(
         val leftNorm: Float,
@@ -90,10 +171,9 @@ class TemplateStorage(private val context: Context) {
         }
     }
     
-    fun saveTemplate(transferId: Int, state: TransferState, bitmap: Bitmap): Boolean {
-        return saveTemplate(transferId, state, bitmap, null)
-    }
-
+    /**
+     * Guarda template con metadatos ROI dual (nuevo flujo)
+     */
     fun saveTemplate(
         transferId: Int,
         state: TransferState,
@@ -109,16 +189,17 @@ class TemplateStorage(private val context: Context) {
             val filename = getTemplateFilename(transferId, state)
             val file = File(templatesDir, filename)
             
-            // Resize bitmap to fixed template size
-            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, TEMPLATE_WIDTH, TEMPLATE_HEIGHT, true)
-            
+            // Guardar bitmap tal cual (sin resize forzado, el resize se hace según estrategia)
             FileOutputStream(file).use { out ->
-                resizedBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
 
             saveSpatialMetadata(file, transferId, state, spatialMetadata)
             
-            Log.d(TAG, "Template saved: $filename")
+            val roiInfo = spatialMetadata?.let { 
+                "dualRoi=${it.hasDualRoi} lane=${it.laneRoi.width}x${it.laneRoi.height}" 
+            } ?: "no_metadata"
+            Log.d(TAG, "Template saved: $filename ($roiInfo)")
             updateManifest()
             return true
             
@@ -128,12 +209,11 @@ class TemplateStorage(private val context: Context) {
         }
     }
     
-    fun loadTemplate(transferId: Int, state: TransferState): Bitmap? {
-        return loadTemplates(transferId, state).firstOrNull()
-    }
-
-    fun loadTemplates(transferId: Int, state: TransferState): List<Bitmap> {
-        return loadTemplateSamples(transferId, state).map { it.bitmap }
+    /**
+     * Carga una muestra específica con metadatos completos
+     */
+    fun loadTemplateSample(transferId: Int, state: TransferState): TemplateSample? {
+        return loadTemplateSamples(transferId, state).firstOrNull()
     }
 
     fun loadTemplateSamples(transferId: Int, state: TransferState): List<TemplateSample> {
@@ -149,10 +229,13 @@ class TemplateStorage(private val context: Context) {
                 TemplateSample(file.name, bitmap, metadata)
             }
 
-            val withSpatial = samples.count { it.spatialMetadata != null }
+            val withDualRoi = samples.count { it.spatialMetadata?.hasDualRoi == true }
+            val withLaneOnly = samples.count { it.spatialMetadata?.isLegacy == false && it.spatialMetadata?.hasDualRoi == false }
+            val legacy = samples.count { it.spatialMetadata == null || it.spatialMetadata?.isLegacy == true }
+            
             Log.d(
                 TAG,
-                "Loaded ${samples.size} templates for T$transferId ${state.displayName} (spatialMeta=$withSpatial)"
+                "Loaded ${samples.size} templates for T$transferId ${state.displayName} (dualRoi=$withDualRoi, laneOnly=$withLaneOnly, legacy=$legacy)"
             )
             return samples
         } catch (e: Exception) {
@@ -273,6 +356,9 @@ class TemplateStorage(private val context: Context) {
         return File(templatesDir, "${templateFile.name}.meta.json")
     }
 
+    /**
+     * Guarda metadatos espaciales ROI dual en formato JSON
+     */
     private fun saveSpatialMetadata(
         templateFile: File,
         transferId: Int,
@@ -293,18 +379,31 @@ class TemplateStorage(private val context: Context) {
                 put("templateFile", templateFile.name)
                 put("transferId", transferId)
                 put("state", state.name)
-                put("left", spatialMetadata.left)
-                put("top", spatialMetadata.top)
-                put("right", spatialMetadata.right)
-                put("bottom", spatialMetadata.bottom)
+                
+                // Lane ROI (absoluto en frame)
+                put("laneLeft", spatialMetadata.laneRoi.left)
+                put("laneTop", spatialMetadata.laneRoi.top)
+                put("laneRight", spatialMetadata.laneRoi.right)
+                put("laneBottom", spatialMetadata.laneRoi.bottom)
+                
+                // Search ROI (ROI 1) - relativo a lane, -1 si no existe
+                put("searchLeft", spatialMetadata.searchRoi?.left ?: -1)
+                put("searchTop", spatialMetadata.searchRoi?.top ?: -1)
+                put("searchRight", spatialMetadata.searchRoi?.right ?: -1)
+                put("searchBottom", spatialMetadata.searchRoi?.bottom ?: -1)
+                
+                // Master ROI (ROI 2) - relativo a lane, -1 si no existe
+                put("masterLeft", spatialMetadata.masterRoi?.left ?: -1)
+                put("masterTop", spatialMetadata.masterRoi?.top ?: -1)
+                put("masterRight", spatialMetadata.masterRoi?.right ?: -1)
+                put("masterBottom", spatialMetadata.masterRoi?.bottom ?: -1)
+                
+                // Frame dimensions
                 put("frameWidth", spatialMetadata.frameWidth)
                 put("frameHeight", spatialMetadata.frameHeight)
-                put("centerY", spatialMetadata.centerY.toDouble())
-                put("centerYNorm", spatialMetadata.centerYNorm.toDouble())
-                put("roiHeight", spatialMetadata.roiHeight)
-                put("roiHeightNorm", spatialMetadata.roiHeightNorm.toDouble())
             }
             metadataFile.writeText(metadataJson.toString())
+            Log.d(TAG, "Spatial metadata saved for ${templateFile.name}: dualRoi=${spatialMetadata.hasDualRoi}")
         } catch (e: Exception) {
             Log.w(TAG, "Failed saving spatial metadata for ${templateFile.name}", e)
         }
@@ -360,6 +459,9 @@ class TemplateStorage(private val context: Context) {
         }
     }
 
+    /**
+     * Carga metadatos espaciales desde JSON con soporte para ROI dual
+     */
     private fun loadSpatialMetadata(templateFile: File): SpatialMetadata? {
         return try {
             val metadataFile = getMetadataFile(templateFile)
@@ -368,20 +470,62 @@ class TemplateStorage(private val context: Context) {
             }
 
             val json = JSONObject(metadataFile.readText())
+            val version = json.optInt("version", 1)
+            
+            // Lane ROI siempre debe existir
+            val laneLeft = json.optInt("laneLeft", -1)
+            val laneTop = json.optInt("laneTop", -1)
+            val laneRight = json.optInt("laneRight", -1)
+            val laneBottom = json.optInt("laneBottom", -1)
+            
+            // Fallback v1: usar campos legacy
+            val effectiveLaneLeft = if (laneLeft < 0) json.optInt("left", -1) else laneLeft
+            val effectiveLaneTop = if (laneTop < 0) json.optInt("top", -1) else laneTop
+            val effectiveLaneRight = if (laneRight < 0) json.optInt("right", -1) else laneRight
+            val effectiveLaneBottom = if (laneBottom < 0) json.optInt("bottom", -1) else laneBottom
+            
+            if (effectiveLaneLeft < 0 || effectiveLaneTop < 0 || 
+                effectiveLaneRight <= effectiveLaneLeft || effectiveLaneBottom <= effectiveLaneTop) {
+                return null
+            }
+            
+            val laneRoi = RoiRect(effectiveLaneLeft, effectiveLaneTop, effectiveLaneRight, effectiveLaneBottom)
+            
+            // Search ROI (ROI 1)
+            val searchLeft = json.optInt("searchLeft", -1)
+            val searchRoi = if (searchLeft >= 0) {
+                RoiRect(
+                    searchLeft,
+                    json.optInt("searchTop", -1),
+                    json.optInt("searchRight", -1),
+                    json.optInt("searchBottom", -1)
+                )
+            } else null
+            
+            // Master ROI (ROI 2)
+            val masterLeft = json.optInt("masterLeft", -1)
+            val masterRoi = if (masterLeft >= 0) {
+                RoiRect(
+                    masterLeft,
+                    json.optInt("masterTop", -1),
+                    json.optInt("masterRight", -1),
+                    json.optInt("masterBottom", -1)
+                )
+            } else null
+            
+            val frameWidth = json.optInt("frameWidth", -1)
+            val frameHeight = json.optInt("frameHeight", -1)
+            
+            if (frameWidth <= 0 || frameHeight <= 0) return null
+            
             SpatialMetadata(
-                left = json.optInt("left", -1),
-                top = json.optInt("top", -1),
-                right = json.optInt("right", -1),
-                bottom = json.optInt("bottom", -1),
-                frameWidth = json.optInt("frameWidth", -1),
-                frameHeight = json.optInt("frameHeight", -1)
-            ).takeIf {
-                it.left >= 0 &&
-                    it.top >= 0 &&
-                    it.right > it.left &&
-                    it.bottom > it.top &&
-                    it.frameWidth > 0 &&
-                    it.frameHeight > 0
+                laneRoi = laneRoi,
+                searchRoi = searchRoi?.takeIf { it.isValid },
+                masterRoi = masterRoi?.takeIf { it.isValid },
+                frameWidth = frameWidth,
+                frameHeight = frameHeight
+            ).also {
+                Log.d(TAG, "Loaded metadata for ${templateFile.name}: version=$version, dualRoi=${it.hasDualRoi}")
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed loading spatial metadata for ${templateFile.name}", e)
@@ -450,7 +594,7 @@ class TemplateStorage(private val context: Context) {
                     put("version", manifest.version)
                     put("timestamp", manifest.timestamp)
                     put("spatialMetadataVersion", SPATIAL_METADATA_VERSION)
-                    put("spatialMetadataEnabled", true)
+                    put("dualRoiEnabled", true)
                     put("baseCoverage", JSONObject(manifest.baseCoverage))
                     put("sampleCounts", JSONObject(manifest.sampleCounts))
                     put("totalSamples", manifest.totalSamples)

@@ -446,7 +446,7 @@ class MainActivity : ComponentActivity() {
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "Debug VIGIA (Gestor)",
+                    text = "Debug ROI Dual",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold
                 )
@@ -455,23 +455,23 @@ class MainActivity : ComponentActivity() {
                     Text("Sin snapshot de depuración todavía.")
                 } else {
                     Text("Transfer: T${snapshot.transferId}")
-                    Text("Estrategia ROI: ${snapshot.strategy}")
-                    Text("ROI guardada px: ${snapshot.roiRectPx ?: "n/a"}")
+                    Text("Estrategia: ${snapshot.strategy}")
                     Text("Veredicto: ${snapshot.finalState.displayName} (${snapshot.finalReason}) score=${"%.4f".format(snapshot.finalScore)}")
 
                     snapshot.stateDebug[TransferState.OK]?.let { ok ->
-                        Text("OK -> visual=${"%.4f".format(ok.bestVisual)} structural=${"%.4f".format(ok.bestStructural)} color=${"%.4f".format(ok.bestColor)} spatial=${"%.4f".format(ok.bestSpatial)} final=${"%.4f".format(ok.laneAdjusted)}")
+                        Text("OK -> ${ok.searchStrategy} visual=${"%.4f".format(ok.bestVisual)} final=${"%.4f".format(ok.laneAdjusted)}")
                     }
                     snapshot.stateDebug[TransferState.OBSTACULO]?.let { obst ->
-                        Text("OBST -> visual=${"%.4f".format(obst.bestVisual)} structural=${"%.4f".format(obst.bestStructural)} color=${"%.4f".format(obst.bestColor)} spatial=${"%.4f".format(obst.bestSpatial)} final=${"%.4f".format(obst.laneAdjusted)}")
+                        Text("OBST -> ${obst.searchStrategy} visual=${"%.4f".format(obst.bestVisual)} final=${"%.4f".format(obst.laneAdjusted)}")
                     }
 
+                    // Row 1: Lane actual con Search ROI (azul) y Located ROI (verde)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Lane actual", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                            Text("Lane + Search ROI (azul)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
                             Box(modifier = Modifier.fillMaxWidth().height(90.dp)) {
                                 Image(
                                     bitmap = snapshot.laneBitmap.asImageBitmap(),
@@ -479,7 +479,8 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.fillMaxSize(),
                                     contentScale = ContentScale.Fit
                                 )
-                                snapshot.roiRectPx?.let { roi ->
+                                // Dibujar Search ROI (ROI 1) en azul
+                                snapshot.searchRect?.let { searchRoi ->
                                     Canvas(modifier = Modifier.fillMaxSize()) {
                                         val mapping = ImageUtils.computeFitDisplayMapping(
                                             viewWidth = size.width.toInt(),
@@ -487,12 +488,33 @@ class MainActivity : ComponentActivity() {
                                             bitmapWidth = snapshot.laneBitmap.width,
                                             bitmapHeight = snapshot.laneBitmap.height
                                         )
-                                        val left = mapping.offsetX + (roi.left.toFloat() * mapping.scale)
-                                        val top = mapping.offsetY + (roi.top.toFloat() * mapping.scale)
-                                        val right = mapping.offsetX + (roi.right.toFloat() * mapping.scale)
-                                        val bottom = mapping.offsetY + (roi.bottom.toFloat() * mapping.scale)
+                                        val left = mapping.offsetX + (searchRoi.left.toFloat() * mapping.scale)
+                                        val top = mapping.offsetY + (searchRoi.top.toFloat() * mapping.scale)
+                                        val right = mapping.offsetX + (searchRoi.right.toFloat() * mapping.scale)
+                                        val bottom = mapping.offsetY + (searchRoi.bottom.toFloat() * mapping.scale)
                                         drawRect(
-                                            color = Color.Red,
+                                            color = Color.Blue,
+                                            topLeft = Offset(left, top),
+                                            size = Size(right - left, bottom - top),
+                                            style = Stroke(width = 3f)
+                                        )
+                                    }
+                                }
+                                // Dibujar Located Rect (ventana encontrada) en verde
+                                snapshot.locatedRect?.let { located ->
+                                    Canvas(modifier = Modifier.fillMaxSize()) {
+                                        val mapping = ImageUtils.computeFitDisplayMapping(
+                                            viewWidth = size.width.toInt(),
+                                            viewHeight = size.height.toInt(),
+                                            bitmapWidth = snapshot.laneBitmap.width,
+                                            bitmapHeight = snapshot.laneBitmap.height
+                                        )
+                                        val left = mapping.offsetX + (located.left.toFloat() * mapping.scale)
+                                        val top = mapping.offsetY + (located.top.toFloat() * mapping.scale)
+                                        val right = mapping.offsetX + (located.right.toFloat() * mapping.scale)
+                                        val bottom = mapping.offsetY + (located.bottom.toFloat() * mapping.scale)
+                                        drawRect(
+                                            color = Color.Green,
                                             topLeft = Offset(left, top),
                                             size = Size(right - left, bottom - top),
                                             style = Stroke(width = 2f)
@@ -502,24 +524,29 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Recorte comparado", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                            Image(bitmap = snapshot.comparedBitmap.asImageBitmap(), contentDescription = "Compared", modifier = Modifier.fillMaxWidth().height(90.dp))
+                            Text("Ventana actual (localizada)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                            Image(
+                                bitmap = snapshot.currentWindowBitmap.asImageBitmap(),
+                                contentDescription = "Current Window",
+                                modifier = Modifier.fillMaxWidth().height(90.dp)
+                            )
                         }
                     }
 
+                    // Row 2: Referencias OK y OBST
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         snapshot.okReference?.let {
                             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text("Referencia OK", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                Text("Referencia OK (maestra)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
                                 Image(bitmap = it.asImageBitmap(), contentDescription = "OK ref", modifier = Modifier.fillMaxWidth().height(90.dp))
                             }
                         }
                         snapshot.obstaculoReference?.let {
                             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text("Referencia OBST", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                Text("Referencia OBST (maestra)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
                                 Image(bitmap = it.asImageBitmap(), contentDescription = "OBST ref", modifier = Modifier.fillMaxWidth().height(90.dp))
                             }
                         }

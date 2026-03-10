@@ -1,23 +1,32 @@
 /**
- * TrainingActivity.kt - UI de captura de muestras maestras para entrenamiento
+ * TrainingActivity.kt - UI de captura de muestras maestras con ROI dual
  *
  * Propósito: Interfaz de usuario para capturar y guardar muestras de referencia
- *            de los diferentes estados de los transfers (OK, OBSTACULO).
+ *            con sistema ROI dual (Search ROI + Master ROI).
  *
- * Alcance: Lógica de captura con selección manual rectangular sobre preview.
- *          El usuario dibuja la ROI deseada y se recorta al guardar.
+ * Alcance: 
+ *   - Flujo de captura con dos selecciones manuales:
+ *     1. ROI 1 (search): Zona donde buscar el transfer en runtime
+ *     2. ROI 2 (master): Muestra maestra exacta del transfer
+ *   - Persistencia de ambas ROIs en metadatos
+ *   - Preview visual de selecciones con colores distintivos
  *
- * Modo temporal activo: T100 únicamente, estados OK y OBSTACULO habilitados.
- *                       FALLO desactivado. ROI manual persistente desactivado.
+ * Modo temporal activo: T100 + OK/OBSTACULO
+ *   - FALLO desactivado
+ *   - T200/T300 desactivados
  *
- * Cambios recientes (SDD):
- *   - Eliminado bloque visible "Calibración ROI Manual (Gestor)"
- *   - Renombrados textos: plantilla -> muestra maestra, Template Captured, etc.
- *   - captureTemplate() ya no usa ROI manual persistente, solo lane completa
- *   - Selección manual rectangular sobre preview, aplicada al guardar
- *   - testRecorteAutomatico() limpia estado de guardado para evitar confusión
+ * Sistema ROI Dual:
+ *   - El usuario captura la lane completa
+ *   - Dibuja ROI 1 (zona de búsqueda) - color AZUL
+ *   - Dibuja ROI 2 (muestra maestra) - color ROJO, debe estar dentro de ROI 1
+ *   - Se guarda la región de ROI 2 como muestra maestra
+ *
+ * Cambios recientes (SDD - ROI Dual):
+ *   - Dos selecciones manuales diferenciadas (search + master)
+ *   - Validación: ROI 2 debe estar contenida en ROI 1
+ *   - Metadatos espaciales ROI dual persistidos
+ *   - Eliminada dependencia de center crop
  */
-
 package com.mindaplus.android
 
 import android.graphics.Bitmap
@@ -75,17 +84,14 @@ class TrainingActivity : ComponentActivity() {
     private var pendingTemplateBitmap by mutableStateOf<Bitmap?>(null)
     private var pendingFrameWidth by mutableStateOf<Int?>(null)
     private var pendingFrameHeight by mutableStateOf<Int?>(null)
-    private var calibrationLaneBitmap by mutableStateOf<Bitmap?>(null)
-    private var manualRoi by mutableStateOf<TemplateStorage.ManualRoi?>(null)
-    private var calibrationStart by mutableStateOf<Offset?>(null)
-    private var calibrationEnd by mutableStateOf<Offset?>(null)
-    private var calibrationCanvasSize by mutableStateOf(IntSize.Zero)
     
-    // Estado para selección manual rectangular en flujo de muestra maestra (NO persistente)
-    private var muestraMaestraSelectionStart by mutableStateOf<Offset?>(null)
-    private var muestraMaestraSelectionEnd by mutableStateOf<Offset?>(null)
-    private var muestraMaestraCanvasSize by mutableStateOf(IntSize.Zero)
-    private var muestraMaestraBitmap by mutableStateOf<Bitmap?>(null)
+    // Estado para selección ROI dual
+    private var roi1SelectionStart by mutableStateOf<Offset?>(null)  // Search ROI (azul)
+    private var roi1SelectionEnd by mutableStateOf<Offset?>(null)
+    private var roi2SelectionStart by mutableStateOf<Offset?>(null)  // Master ROI (rojo)
+    private var roi2SelectionEnd by mutableStateOf<Offset?>(null)
+    private var selectionCanvasSize by mutableStateOf(IntSize.Zero)
+    private var lanePreviewBitmap by mutableStateOf<Bitmap?>(null)
     
     companion object {
         private const val TAG = "TrainingActivity"
@@ -94,10 +100,8 @@ class TrainingActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Force landscape orientation
         requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         
-        // Initialize components
         cameraManager = CameraManager(this)
         transferMonitor = TransferMonitor(this)
         templateStorage = TemplateStorage(this)
@@ -109,25 +113,18 @@ class TrainingActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    LaunchedEffect(selectedTransfer) {
-                        manualRoi = transferMonitor.getManualRoi(selectedTransfer)
-                    }
                     TrainingScreen()
                 }
             }
         }
         
-        // Initialize camera
         initializeCamera()
-        
-        // Update training progress
         updateTrainingProgress()
     }
     
     override fun onResume() {
         super.onResume()
         updateTrainingProgress()
-        manualRoi = transferMonitor.getManualRoi(selectedTransfer)
     }
     
     private fun initializeCamera() {
@@ -141,7 +138,6 @@ class TrainingActivity : ComponentActivity() {
             lifecycleOwner = this,
             previewView = previewView,
             onFrameAnalyzed = { bitmap ->
-                // Store the latest bitmap for template capture
                 lastCapturedBitmap = bitmap
             }
         )
@@ -151,7 +147,6 @@ class TrainingActivity : ComponentActivity() {
         val stats = templateStorage.getTrainingStats()
         trainingProgress = stats.baseCovered to stats.baseTotal
         totalSamples = stats.totalSamples
-        manualRoi = transferMonitor.getManualRoi(selectedTransfer)
     }
     
     @Composable
@@ -271,6 +266,7 @@ class TrainingActivity : ComponentActivity() {
                     }
                 }
                 
+                // State Selection
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
@@ -280,12 +276,12 @@ class TrainingActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            text = "Estado manual de la muestra maestra",
+                            text = "Estado de la muestra maestra",
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Selecciona explícitamente el estado que se guardará para esta captura:",
+                            text = "Selecciona el estado que se guardará para esta captura:",
                             style = MaterialTheme.typography.bodyMedium,
                             color = Color.Gray
                         )
@@ -324,41 +320,8 @@ class TrainingActivity : ComponentActivity() {
                     }
                 }
                 
-                // Current Selection
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(
-                            text = "Current Selection",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold
-                        )
-                        
-                        Text(
-                            text = "Transfer: T$selectedTransfer",
-                            style = MaterialTheme.typography.bodyLarge
-                        )
-                        
-                        Text(
-                            text = "State: ${selectedState.displayName}",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = when (selectedState) {
-                                TransferState.OK -> Color.Green
-                                TransferState.OBSTACULO -> Color.Red
-                                TransferState.FALLO -> Color(0xFFFFA500)
-                                TransferState.UNKNOWN -> Color.Gray
-                            }
-                        )
-                    }
-                }
-                
-                // Template Preview (shown after capture) con selección manual rectangular
-                if (capturedTemplatePreview != null && detectedLaneRegion != null) {
+                // ROI Dual Selection Preview
+                if (lanePreviewBitmap != null && detectedLaneRegion != null) {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
@@ -368,89 +331,114 @@ class TrainingActivity : ComponentActivity() {
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = "Muestra maestra capturada",
+                                text = "Selección ROI Dual",
                                 style = MaterialTheme.typography.headlineSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.Green
                             )
                             
                             Text(
-                                text = "Transfer: T${lastCapturedTransfer ?: selectedTransfer}, State: ${lastCapturedState?.displayName ?: selectedState.displayName}",
-                                style = MaterialTheme.typography.bodyMedium
+                                text = "1. Dibuja ROI AZUL (zona de búsqueda)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.Blue
                             )
-                            
                             Text(
-                                text = "Detected region: ${detectedLaneRegion?.left ?: 0},${detectedLaneRegion?.top ?: 0} to ${detectedLaneRegion?.right ?: 0},${detectedLaneRegion?.bottom ?: 0}",
+                                text = "2. Dibuja ROI ROJO (muestra maestra)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.Red
+                            )
+                            Text(
+                                text = "El ROI rojo debe estar dentro del azul",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Color.Gray
                             )
                             
-                            // Preview con selección manual rectangular interactiva
-                            capturedTemplatePreview?.let { bitmap ->
+                            // Preview con selección dual
+                            lanePreviewBitmap?.let { bitmap ->
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(180.dp)
+                                        .height(200.dp)
                                 ) {
                                     Image(
                                         bitmap = bitmap.asImageBitmap(),
-                                        contentDescription = "Template Preview",
+                                        contentDescription = "Lane Preview",
                                         modifier = Modifier.fillMaxSize(),
                                         contentScale = ContentScale.Fit
                                     )
                                     Canvas(
                                         modifier = Modifier
                                             .fillMaxSize()
-                                            .onSizeChanged { muestraMaestraCanvasSize = it }
+                                            .onSizeChanged { selectionCanvasSize = it }
                                             .pointerInput(bitmap) {
                                                 detectDragGestures(
                                                     onDragStart = { offset ->
-                                                        muestraMaestraSelectionStart = offset
-                                                        muestraMaestraSelectionEnd = offset
-                                                        muestraMaestraBitmap = bitmap
+                                                        // Alternar entre ROI 1 y ROI 2 según botón activo
+                                                        if (roi1SelectionStart == null || roi1SelectionEnd != null) {
+                                                            // Resetear ROI 1
+                                                            roi1SelectionStart = offset
+                                                            roi1SelectionEnd = offset
+                                                            roi2SelectionStart = null
+                                                            roi2SelectionEnd = null
+                                                        } else {
+                                                            // ROI 1 ya existe, dibujar ROI 2
+                                                            if (roi2SelectionStart == null) {
+                                                                roi2SelectionStart = offset
+                                                                roi2SelectionEnd = offset
+                                                            }
+                                                        }
                                                     },
                                                     onDrag = { change, _ ->
-                                                        muestraMaestraSelectionEnd = change.position
+                                                        when {
+                                                            roi2SelectionStart != null -> {
+                                                                roi2SelectionEnd = change.position
+                                                            }
+                                                            roi1SelectionStart != null -> {
+                                                                roi1SelectionEnd = change.position
+                                                            }
+                                                        }
                                                     }
                                                 )
                                             }
                                     ) {
-                                        // Dibujar rectángulo de selección si existe
-                                        val start = muestraMaestraSelectionStart
-                                        val end = muestraMaestraSelectionEnd
-                                        if (start != null && end != null) {
-                                            val left = min(start.x, end.x)
-                                            val top = min(start.y, end.y)
-                                            val right = max(start.x, end.x)
-                                            val bottom = max(start.y, end.y)
-                                            
-                                            drawRect(
-                                                color = Color.Red,
-                                                topLeft = Offset(left, top),
-                                                size = Size(right - left, bottom - top),
-                                                style = Stroke(width = 3f)
-                                            )
+                                        // Dibujar ROI 1 (Search) - AZUL
+                                        roi1SelectionStart?.let { start ->
+                                            roi1SelectionEnd?.let { end ->
+                                                val left = min(start.x, end.x)
+                                                val top = min(start.y, end.y)
+                                                val right = max(start.x, end.x)
+                                                val bottom = max(start.y, end.y)
+                                                
+                                                drawRect(
+                                                    color = Color.Blue,
+                                                    topLeft = Offset(left, top),
+                                                    size = Size(right - left, bottom - top),
+                                                    style = Stroke(width = 4f)
+                                                )
+                                            }
+                                        }
+                                        
+                                        // Dibujar ROI 2 (Master) - ROJO
+                                        roi2SelectionStart?.let { start ->
+                                            roi2SelectionEnd?.let { end ->
+                                                val left = min(start.x, end.x)
+                                                val top = min(start.y, end.y)
+                                                val right = max(start.x, end.x)
+                                                val bottom = max(start.y, end.y)
+                                                
+                                                drawRect(
+                                                    color = Color.Red,
+                                                    topLeft = Offset(left, top),
+                                                    size = Size(right - left, bottom - top),
+                                                    style = Stroke(width = 4f)
+                                                )
+                                            }
                                         }
                                     }
                                 }
                                 
-                                // Mostrar coordenadas de selección si existen
-                                muestraMaestraSelectionStart?.let { start ->
-                                    muestraMaestraSelectionEnd?.let { end ->
-                                        val normCoords = calcularCoordenadasNormalizadas(
-                                            start, 
-                                            end, 
-                                            muestraMaestraCanvasSize,
-                                            bitmap.width,
-                                            bitmap.height
-                                        )
-                                        Text(
-                                            text = "Selección: (${"%.3f".format(normCoords.first)}, ${"%.3f".format(normCoords.second)}) - (${"%.3f".format(normCoords.third)}, ${"%.3f".format(normCoords.fourth)})",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = Color.Blue
-                                        )
-                                    }
-                                }
+                                // Mostrar info de selecciones
+                                SelectionInfo()
                             }
                         }
                     }
@@ -462,38 +450,31 @@ class TrainingActivity : ComponentActivity() {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Button(
-                        onClick = { capturarMuestraMaestra() },
+                        onClick = { capturarParaSeleccionDual() },
                         modifier = Modifier.weight(1f),
-                        enabled = !isCapturing && selectedState != TransferState.UNKNOWN
+                        enabled = !isCapturing && selectedState != TransferState.UNKNOWN && lanePreviewBitmap == null
                     ) {
-                        Text("Capturar muestra maestra")
+                        Text("1. Capturar para selección")
                     }
                     
                     Button(
-                        onClick = { guardarMuestraMaestra() },
+                        onClick = { guardarMuestraDual() },
                         modifier = Modifier.weight(1f),
-                        enabled = capturedTemplatePreview != null && 
+                        enabled = lanePreviewBitmap != null && 
+                                 roi1SelectionStart != null && roi1SelectionEnd != null &&
+                                 roi2SelectionStart != null && roi2SelectionEnd != null &&
                                  lastCapturedTransfer == selectedTransfer && 
                                  lastCapturedState == selectedState
                     ) {
-                        Text("Guardar muestra")
+                        Text("2. Guardar muestra")
                     }
                 }
                 
                 Button(
-                        onClick = { cancelarCaptura() },
+                    onClick = { cancelarCapturaDual() },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Cancelar")
-                }
-
-                // Botón de test para recorte automático (NO guarda)
-                OutlinedButton(
-                    onClick = { testRecorteAutomatico() },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isCapturing
-                ) {
-                    Text("Test recorte automático")
                 }
 
                 Row(
@@ -521,36 +502,38 @@ class TrainingActivity : ComponentActivity() {
     }
     
     @Composable
-    private fun TransferButton(transferId: Int, isSelected: Boolean, onClick: () -> Unit) {
-        Button(
-            onClick = onClick,
-            modifier = Modifier.fillMaxWidth(),
-            colors = if (isSelected) {
-                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-            } else {
-                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+    private fun SelectionInfo() {
+        Column {
+            // ROI 1 info
+            roi1SelectionStart?.let { start1 ->
+                roi1SelectionEnd?.let { end1 ->
+                    val norm1 = calcularCoordenadasNormalizadas(start1, end1, selectionCanvasSize, lanePreviewBitmap?.width ?: 1, lanePreviewBitmap?.height ?: 1)
+                    Text(
+                        text = "ROI 1 (búsqueda): ${"%.2f".format(norm1.first)},${"%.2f".format(norm1.second)} - ${"%.2f".format(norm1.third)},${"%.2f".format(norm1.fourth)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Blue
+                    )
+                }
             }
-        ) {
-            Text("T$transferId")
+            
+            // ROI 2 info
+            roi2SelectionStart?.let { start2 ->
+                roi2SelectionEnd?.let { end2 ->
+                    val norm2 = calcularCoordenadasNormalizadas(start2, end2, selectionCanvasSize, lanePreviewBitmap?.width ?: 1, lanePreviewBitmap?.height ?: 1)
+                    Text(
+                        text = "ROI 2 (maestra): ${"%.2f".format(norm2.first)},${"%.2f".format(norm2.second)} - ${"%.2f".format(norm2.third)},${"%.2f".format(norm2.fourth)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Red
+                    )
+                }
+            }
         }
     }
     
-    @Composable
-    private fun StateButton(text: String, isSelected: Boolean, onClick: () -> Unit) {
-        Button(
-            onClick = onClick,
-            modifier = Modifier.fillMaxWidth(),
-            colors = if (isSelected) {
-                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-            } else {
-                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
-            }
-        ) {
-            Text(text)
-        }
-    }
-    
-    private fun capturarMuestraMaestra() {
+    /**
+     * Captura frame actual y prepara para selección ROI dual
+     */
+    private fun capturarParaSeleccionDual() {
         if (isCapturing) return
         if (!MonitoringMode.isTransferEnabled(selectedTransfer) || !MonitoringMode.isStateEnabled(selectedState)) {
             showMessage("Modo temporal: selección no habilitada")
@@ -558,368 +541,212 @@ class TrainingActivity : ComponentActivity() {
         }
         
         isCapturing = true
-                Log.d(TAG, "Captura muestra maestra iniciada para T$selectedTransfer ${selectedState.displayName}")
+        Log.d(TAG, "Captura para selección dual iniciada: T$selectedTransfer ${selectedState.displayName}")
         
         lifecycleScope.launch {
             try {
                 val bitmap = lastCapturedBitmap
                 if (bitmap == null) {
-                    Log.w(TAG, "No bitmap available for template capture")
-                    showMessage("No hay imagen disponible para captura")
+                    showMessage("No hay imagen disponible")
                     isCapturing = false
                     return@launch
                 }
                 
-                Log.d(TAG, "Processing bitmap for template capture: ${bitmap.width}x${bitmap.height}")
-                
-                // Step 1: Detect lanes to find the correct region for this transfer
+                // Detectar lanes
                 val laneDetection = laneDetector.detectLanes(bitmap)
                 if (laneDetection.requiresCalibration || laneDetection.lanes == null) {
-                    Log.e(TAG, "Lane detection failed - cannot capture template")
-                    showMessage("Error: No se pudieron detectar las vías")
+                    showMessage("Error: No se detectaron vías")
                     isCapturing = false
                     return@launch
                 }
                 
                 val lanes = laneDetection.lanes
-                Log.d(TAG, "Successfully detected ${lanes.size} lanes")
-                
-                // Step 2: Select the appropriate lane based on transfer selection
                 val targetLaneIndex = when (selectedTransfer) {
-                    100 -> 0 // Upper lane (T100)
-                    200 -> 1 // Middle lane (T200)
-                    300 -> 2 // Lower lane (T300)
-                    else -> {
-                        Log.e(TAG, "Invalid transfer selection: $selectedTransfer")
-                        showMessage("Error: Transfer inválido")
-                        isCapturing = false
-                        return@launch
-                    }
+                    100 -> 0
+                    200 -> 1
+                    300 -> 2
+                    else -> 0
                 }
                 
                 if (targetLaneIndex >= lanes.size) {
-                    Log.e(TAG, "Target lane index $targetLaneIndex out of bounds for ${lanes.size} lanes")
                     showMessage("Error: Vía no detectada")
                     isCapturing = false
                     return@launch
                 }
                 
                 val targetLane = lanes[targetLaneIndex]
-                Log.d(TAG, "Selected lane $targetLaneIndex for T$selectedTransfer: $targetLane")
                 
-                // Step 3: Crop bitmap to the detected lane region (solo lane completa, sin ROI manual)
+                // Recortar lane para preview
                 val laneBitmap = ImageUtils.cropBitmap(bitmap, targetLane.left, targetLane.top, targetLane.right, targetLane.bottom)
                 if (laneBitmap == null) {
-                    Log.e(TAG, "Failed to crop bitmap to lane region")
-                    showMessage("Error al recortar la región")
+                    showMessage("Error al recortar la vía")
                     isCapturing = false
                     return@launch
                 }
-
-                // Modo simplificado: usar lane completa como muestra, sin ROI manual persistente
-                val focusedBitmap = laneBitmap
                 
-                Log.d(
-                    TAG,
-                    "Muestra capturada (modo simplificado): laneCompleta=${laneBitmap.width}x${laneBitmap.height}"
-                )
-                
-                // Step 4: Store the cropped template for preview (NO guardar todavía)
-                // Update UI with preview and region info
-                capturedTemplatePreview = focusedBitmap
+                // Guardar estado para posterior guardado
+                lanePreviewBitmap = laneBitmap
                 detectedLaneRegion = targetLane
                 lastCapturedTransfer = selectedTransfer
                 lastCapturedState = selectedState
-                pendingTemplateBitmap = focusedBitmap // Guardar para cuando se pulse "Guardar"
                 pendingFrameWidth = bitmap.width
                 pendingFrameHeight = bitmap.height
                 
-                showMessage("Template capturado exitosamente - Región detectada: ${targetLane.left},${targetLane.top} a ${targetLane.right},${targetLane.bottom}")
+                // Resetear selecciones
+                roi1SelectionStart = null
+                roi1SelectionEnd = null
+                roi2SelectionStart = null
+                roi2SelectionEnd = null
+                
+                showMessage("Lane capturada. Dibuja ROI azul (búsqueda) y luego ROI rojo (maestra)")
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Error capturing template", e)
-                showMessage("Error al capturar template: ${e.message}")
+                Log.e(TAG, "Error en captura dual", e)
+                showMessage("Error: ${e.message}")
             } finally {
                 isCapturing = false
             }
         }
     }
     
-    private fun cropToRegion(bitmap: Bitmap, region: LaneDetector.LaneRegion): Bitmap? {
-        return try {
-            // Ensure region is within bitmap bounds
-            val left = region.left.coerceIn(0, bitmap.width - 1)
-            val top = region.top.coerceIn(0, bitmap.height - 1)
-            val right = region.right.coerceIn(left + 1, bitmap.width)
-            val bottom = region.bottom.coerceIn(top + 1, bitmap.height)
-            
-            val width = right - left
-            val height = bottom - top
-            
-            if (width <= 0 || height <= 0) {
-                Log.e(TAG, "Invalid crop dimensions: ${width}x${height}")
-                return null
-            }
-            
-            Bitmap.createBitmap(bitmap, left, top, width, height)
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error cropping bitmap to region", e)
-            null
-        }
-    }
-    
-    private fun cancelarCaptura() {
-        Log.d(TAG, "Canceling current capture and clearing preview")
-        clearPendingCaptureData()
-        showMessage("Captura cancelada")
-    }
-    
-    private fun guardarMuestraMaestra() {
-        Log.d(TAG, "Guardando muestra maestra")
-        
+    /**
+     * Guarda la muestra con metadatos ROI dual
+     */
+    private fun guardarMuestraDual() {
         lifecycleScope.launch {
             try {
-                // Verificar que tenemos un template pendiente para guardar
-                val templateBitmap = pendingTemplateBitmap
-                val transfer = lastCapturedTransfer
-                val state = lastCapturedState
+                val laneBitmap = lanePreviewBitmap
                 val laneRegion = detectedLaneRegion
                 val frameWidth = pendingFrameWidth
                 val frameHeight = pendingFrameHeight
                 
-                if (templateBitmap == null || transfer == null || state == null) {
-                    Log.e(TAG, "No hay muestra maestra pendiente para guardar")
-                    showMessage("Error: No hay muestra maestra pendiente para guardar")
+                if (laneBitmap == null || laneRegion == null || frameWidth == null || frameHeight == null) {
+                    showMessage("Error: No hay datos de captura")
                     return@launch
                 }
                 
-                // Verificar si existe selección manual válida
-                val selectionStart = muestraMaestraSelectionStart
-                val selectionEnd = muestraMaestraSelectionEnd
-                val canvasSize = muestraMaestraCanvasSize
-                
-                val bitmapParaGuardar = if (selectionStart != null && 
-                                            selectionEnd != null && 
-                                            canvasSize.width > 0 && 
-                                            canvasSize.height > 0 &&
-                                            muestraMaestraBitmap != null) {
-                    // Hay selección manual válida, aplicar recorte
-                    val coords = calcularCoordenadasNormalizadas(
-                        selectionStart,
-                        selectionEnd,
-                        canvasSize,
-                        templateBitmap.width,
-                        templateBitmap.height
-                    )
-                    
-                    // Verificar que la selección sea válida (mínimo 3% en cada dimensión)
-                    if (coords.third - coords.first < 0.03f || coords.fourth - coords.second < 0.03f) {
-                        Log.w(TAG, "Selección manual demasiado pequeña")
-                        showMessage("Error: La selección es demasiado pequeña. Dibuja un área mayor.")
-                        isCapturing = false
-                        return@launch
-                    }
-                    
-                    // Recortar según selección manual
-                    val left = (coords.first * templateBitmap.width).toInt().coerceIn(0, templateBitmap.width - 1)
-                    val top = (coords.second * templateBitmap.height).toInt().coerceIn(0, templateBitmap.height - 1)
-                    val right = (coords.third * templateBitmap.width).toInt().coerceIn(left + 1, templateBitmap.width)
-                    val bottom = (coords.fourth * templateBitmap.height).toInt().coerceIn(top + 1, templateBitmap.height)
-                    
-                    val recortado = ImageUtils.cropBitmap(templateBitmap, left, top, right, bottom)
-                    
-                    if (recortado != null) {
-                        Log.d(TAG, "Muestra recortada con selección manual: ${recortado.width}x${recortado.height}")
-                        recortado
-                    } else {
-                        Log.w(TAG, "Fallo al recortar con selección manual, usando bitmap completo")
-                        templateBitmap
-                    }
-                } else {
-                    // No hay selección manual válida, mostrar mensaje de error
-                    Log.w(TAG, "No hay selección manual válida para guardar")
-                    showMessage("Error: Debes dibujar una selección rectangular sobre la preview antes de guardar")
-                    isCapturing = false
+                // Verificar selecciones
+                if (roi1SelectionStart == null || roi1SelectionEnd == null ||
+                    roi2SelectionStart == null || roi2SelectionEnd == null) {
+                    showMessage("Error: Faltan selecciones ROI")
                     return@launch
                 }
                 
-                // Guardar el template en TemplateStorage
-                val success = transferMonitor.addLabeledSample(
-                    transferId = transfer,
-                    state = state,
-                    bitmap = bitmapParaGuardar,
-                    laneRegion = laneRegion,
-                    frameWidth = frameWidth ?: bitmapParaGuardar.width,
-                    frameHeight = frameHeight ?: bitmapParaGuardar.height
+                // Calcular coordenadas normalizadas
+                val normRoi1 = calcularCoordenadasNormalizadas(
+                    roi1SelectionStart!!, roi1SelectionEnd!!,
+                    selectionCanvasSize, laneBitmap.width, laneBitmap.height
                 )
+                val normRoi2 = calcularCoordenadasNormalizadas(
+                    roi2SelectionStart!!, roi2SelectionEnd!!,
+                    selectionCanvasSize, laneBitmap.width, laneBitmap.height
+                )
+                
+                // Validar tamaños mínimos
+                if (normRoi1.third - normRoi1.first < 0.05f || normRoi1.fourth - normRoi1.second < 0.05f) {
+                    showMessage("Error: ROI 1 (azul) demasiado pequeño")
+                    return@launch
+                }
+                if (normRoi2.third - normRoi2.first < 0.03f || normRoi2.fourth - normRoi2.second < 0.03f) {
+                    showMessage("Error: ROI 2 (rojo) demasiado pequeño")
+                    return@launch
+                }
+                
+                // Validar que ROI 2 esté dentro de ROI 1
+                if (!roiContieneOtra(normRoi1, normRoi2)) {
+                    showMessage("Error: ROI 2 debe estar dentro de ROI 1")
+                    return@launch
+                }
+                
+                // Crear RoiRects (coordenadas relativas a la lane)
+                val searchRoi = TemplateStorage.RoiRect.fromNormalized(
+                    normRoi1.first, normRoi1.second, normRoi1.third, normRoi1.fourth,
+                    laneBitmap.width, laneBitmap.height
+                )
+                val masterRoi = TemplateStorage.RoiRect.fromNormalized(
+                    normRoi2.first, normRoi2.second, normRoi2.third, normRoi2.fourth,
+                    laneBitmap.width, laneBitmap.height
+                )
+                
+                // Lane ROI en coordenadas del frame original
+                val laneRoi = TemplateStorage.RoiRect(
+                    laneRegion.left, laneRegion.top, laneRegion.right, laneRegion.bottom
+                )
+                
+                // Recortar la muestra maestra (ROI 2)
+                val masterBitmap = ImageUtils.cropBitmap(
+                    laneBitmap,
+                    masterRoi.left, masterRoi.top, masterRoi.right, masterRoi.bottom
+                )
+                
+                if (masterBitmap == null) {
+                    showMessage("Error al recortar muestra maestra")
+                    return@launch
+                }
+                
+                // Crear metadatos espaciales
+                val spatialMetadata = TemplateStorage.SpatialMetadata(
+                    laneRoi = laneRoi,
+                    searchRoi = searchRoi,
+                    masterRoi = masterRoi,
+                    frameWidth = frameWidth,
+                    frameHeight = frameHeight
+                )
+                
+                // Guardar
+                val success = transferMonitor.addLabeledSampleWithMetadata(
+                    transferId = selectedTransfer,
+                    state = selectedState,
+                    bitmap = masterBitmap,
+                    spatialMetadata = spatialMetadata
+                )
+                
                 if (success) {
-                    val centerY = laneRegion?.let { (it.top + it.bottom) / 2f }
-                    Log.d(
-                        TAG,
-                        "Muestra guardada exitosamente para T$transfer ${state.displayName} lane=${laneRegion ?: "legacy/no-roi"} centerY=${centerY?.let { "%.1f".format(it) } ?: "n/a"} frame=${frameWidth ?: bitmapParaGuardar.width}x${frameHeight ?: bitmapParaGuardar.height}"
-                    )
-                    
-                    // Actualizar progreso
                     updateTrainingProgress()
-                    
-                    // Verificar si el entrenamiento está completo
-                    val stats = templateStorage.getTrainingStats()
-                    if (stats.baseCovered == stats.baseTotal) {
-                        Log.d(TAG, "Base de entrenamiento completa: ${stats.baseCovered}/${stats.baseTotal} con ${stats.totalSamples} muestras")
-                        showMessage("Muestra guardada. Base completa ${stats.baseCovered}/${stats.baseTotal}. Total: ${stats.totalSamples}")
-                    } else {
-                        Log.d(TAG, "Muestra guardada: ${stats.baseCovered}/${stats.baseTotal}, muestras=${stats.totalSamples}")
-                        showMessage("Muestra guardada: base ${stats.baseCovered}/${stats.baseTotal}, total ${stats.totalSamples}")
-                    }
-                    
-                    clearPendingCaptureData()
+                    showMessage("Muestra guardada: ${masterBitmap.width}x${masterBitmap.height} con ROI dual")
+                    limpiarEstadoCaptura()
                 } else {
-                    Log.e(TAG, "Fallo al guardar muestra maestra")
-                    showMessage("Error al guardar la muestra maestra")
+                    showMessage("Error al guardar la muestra")
                 }
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Error guardando muestra maestra", e)
-                showMessage("Error al guardar: ${e.message}")
-            } finally {
-                isCapturing = false
+                Log.e(TAG, "Error guardando muestra dual", e)
+                showMessage("Error: ${e.message}")
             }
         }
     }
-
-    private fun captureLaneForCalibration() {
-        val bitmap = lastCapturedBitmap
-        if (bitmap == null) {
-            showMessage("No hay imagen disponible para calibración")
-            return
-        }
-        val laneDetection = laneDetector.detectLanes(bitmap)
-        val lanes = laneDetection.lanes
-        if (laneDetection.requiresCalibration || lanes == null || lanes.isEmpty()) {
-            showMessage("No se pudo detectar lane para calibración")
-            return
-        }
-        val laneIndex = when (selectedTransfer) {
-            100 -> 0
-            200 -> 1
-            300 -> 2
-            else -> 0
-        }
-        if (laneIndex >= lanes.size) {
-            showMessage("Lane no disponible para calibración")
-            return
-        }
-        val lane = lanes[laneIndex]
-        val laneBitmap = ImageUtils.cropBitmap(bitmap, lane.left, lane.top, lane.right, lane.bottom)
-        if (laneBitmap == null) {
-            showMessage("Error al recortar lane de calibración")
-            return
-        }
-        Log.d(
-            TAG,
-            "Calibration lane capture frame=${bitmap.width}x${bitmap.height} laneRegion=(${lane.left},${lane.top})-(${lane.right},${lane.bottom}) laneBitmap=${laneBitmap.width}x${laneBitmap.height}"
-        )
-        calibrationLaneBitmap = laneBitmap
-        calibrationStart = null
-        calibrationEnd = null
-        showMessage("Lane capturada. Dibuja ROI manual y pulsa Guardar ROI.")
+    
+    /**
+     * Verifica si ROI 1 contiene completamente a ROI 2
+     */
+    private fun roiContieneOtra(roi1: Quadruple<Float, Float, Float, Float>, roi2: Quadruple<Float, Float, Float, Float>): Boolean {
+        return roi2.first >= roi1.first &&    // left2 >= left1
+               roi2.second >= roi1.second &&  // top2 >= top1
+               roi2.third <= roi1.third &&    // right2 <= right1
+               roi2.fourth <= roi1.fourth     // bottom2 <= bottom1
     }
-
-    private fun saveManualRoiFromSelection() {
-        val laneBitmap = calibrationLaneBitmap ?: return
-        val start = calibrationStart ?: return
-        val end = calibrationEnd ?: return
-        if (laneBitmap.width <= 0 || laneBitmap.height <= 0) return
-
-        val mapping = ImageUtils.computeFitDisplayMapping(
-            viewWidth = calibrationCanvasSize.width,
-            viewHeight = calibrationCanvasSize.height,
-            bitmapWidth = laneBitmap.width,
-            bitmapHeight = laneBitmap.height
-        )
-
-        val viewLeft = min(start.x, end.x)
-        val viewTop = min(start.y, end.y)
-        val viewRight = max(start.x, end.x)
-        val viewBottom = max(start.y, end.y)
-
-        val bmpLeft = ((viewLeft - mapping.offsetX) / mapping.scale).coerceIn(0f, laneBitmap.width.toFloat())
-        val bmpTop = ((viewTop - mapping.offsetY) / mapping.scale).coerceIn(0f, laneBitmap.height.toFloat())
-        val bmpRight = ((viewRight - mapping.offsetX) / mapping.scale).coerceIn(0f, laneBitmap.width.toFloat())
-        val bmpBottom = ((viewBottom - mapping.offsetY) / mapping.scale).coerceIn(0f, laneBitmap.height.toFloat())
-
-        val leftNorm = (bmpLeft / laneBitmap.width.toFloat()).coerceIn(0f, 1f)
-        val topNorm = (bmpTop / laneBitmap.height.toFloat()).coerceIn(0f, 1f)
-        val rightNorm = (bmpRight / laneBitmap.width.toFloat()).coerceIn(0f, 1f)
-        val bottomNorm = (bmpBottom / laneBitmap.height.toFloat()).coerceIn(0f, 1f)
-
-        if (rightNorm - leftNorm < 0.03f || bottomNorm - topNorm < 0.03f) {
-            showMessage("ROI demasiado pequeña")
-            return
-        }
-
-        Log.d(
-            TAG,
-            "ROI calibration geometry laneBmp=${laneBitmap.width}x${laneBitmap.height} view=${calibrationCanvasSize.width}x${calibrationCanvasSize.height} scaleMode=Fit scale=${"%.4f".format(mapping.scale)} offset=(${String.format("%.2f", mapping.offsetX)},${String.format("%.2f", mapping.offsetY)}) viewRoi=(${String.format("%.1f", viewLeft)},${String.format("%.1f", viewTop)})-(${String.format("%.1f", viewRight)},${String.format("%.1f", viewBottom)}) bmpRoi=(${String.format("%.1f", bmpLeft)},${String.format("%.1f", bmpTop)})-(${String.format("%.1f", bmpRight)},${String.format("%.1f", bmpBottom)}) normRoi=(${String.format("%.4f", leftNorm)},${String.format("%.4f", topNorm)})-(${String.format("%.4f", rightNorm)},${String.format("%.4f", bottomNorm)})"
-        )
-
-        val roi = TemplateStorage.ManualRoi(
-            leftNorm = leftNorm,
-            topNorm = topNorm,
-            rightNorm = rightNorm,
-            bottomNorm = bottomNorm,
-            updatedAt = System.currentTimeMillis()
-        )
-        val saved = transferMonitor.saveManualRoi(selectedTransfer, roi)
-        if (saved) {
-            manualRoi = transferMonitor.getManualRoi(selectedTransfer)
-            showMessage("ROI manual guardada para T$selectedTransfer")
-            Log.d(TAG, "Manual ROI saved for T$selectedTransfer: $manualRoi")
-        } else {
-            showMessage("Error guardando ROI manual")
-        }
+    
+    private fun cancelarCapturaDual() {
+        limpiarEstadoCaptura()
+        showMessage("Captura cancelada")
     }
-
-    private fun cropManualRoiFromLane(laneBitmap: Bitmap, roi: TemplateStorage.ManualRoi): Bitmap? {
-        if (!roi.isValid()) return null
-        val left = (roi.leftNorm * laneBitmap.width).toInt().coerceIn(0, laneBitmap.width - 1)
-        val top = (roi.topNorm * laneBitmap.height).toInt().coerceIn(0, laneBitmap.height - 1)
-        val right = (roi.rightNorm * laneBitmap.width).toInt().coerceIn(left + 1, laneBitmap.width)
-        val bottom = (roi.bottomNorm * laneBitmap.height).toInt().coerceIn(top + 1, laneBitmap.height)
-        Log.d(
-            TAG,
-            "Applying manual ROI lane=${laneBitmap.width}x${laneBitmap.height} norm=(${String.format("%.4f", roi.leftNorm)},${String.format("%.4f", roi.topNorm)})-(${String.format("%.4f", roi.rightNorm)},${String.format("%.4f", roi.bottomNorm)}) px=($left,$top)-($right,$bottom)"
-        )
-        return ImageUtils.cropBitmap(laneBitmap, left, top, right, bottom)
-    }
-
-    private fun recalibrateTrainingSession() {
-        Log.d(TAG, "Recalibrating training session: clearing lane cache and capture state")
-        laneDetector.clearCache()
-        transferMonitor.recalibrateLanes()
-        clearPendingCaptureData()
-        showMessage("Vías recalibradas. Sesión lista para nueva captura.")
-    }
-
-    private fun clearPendingCaptureData() {
-        capturedTemplatePreview = null
+    
+    private fun limpiarEstadoCaptura() {
+        lanePreviewBitmap = null
         detectedLaneRegion = null
         lastCapturedTransfer = null
         lastCapturedState = null
-        pendingTemplateBitmap = null
         pendingFrameWidth = null
         pendingFrameHeight = null
-        // Limpiar también la selección manual de muestra maestra
-        muestraMaestraSelectionStart = null
-        muestraMaestraSelectionEnd = null
-        muestraMaestraCanvasSize = IntSize.Zero
-        muestraMaestraBitmap = null
+        roi1SelectionStart = null
+        roi1SelectionEnd = null
+        roi2SelectionStart = null
+        roi2SelectionEnd = null
+        selectionCanvasSize = IntSize.Zero
     }
-
+    
     /**
-     * Calcula coordenadas normalizadas (0-1) de la selección manual sobre la preview.
-     * NO guarda en persistencia, solo devuelve valores para uso inmediato.
+     * Calcula coordenadas normalizadas (0-1) de la selección manual
      */
     private fun calcularCoordenadasNormalizadas(
         start: Offset,
@@ -956,167 +783,20 @@ class TrainingActivity : ComponentActivity() {
 
         return Quadruple(leftNorm, topNorm, rightNorm, bottomNorm)
     }
-
-    /**
-     * Data class simple para retornar 4 valores (tupla)
-     */
+    
     data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
-
-    /**
-     * Test del recorte automático sin guardar.
-     * Toma frame actual, detecta lane, aplica center crop temporal y muestra preview.
-     * NO guarda entrenamiento, NO modifica muestras existentes.
-     */
-    private fun testRecorteAutomatico() {
-        if (isCapturing) return
-        
-        isCapturing = true
-        Log.d(TAG, "Test recorte automático iniciado para T$selectedTransfer")
-        
-        lifecycleScope.launch {
-            try {
-                val bitmap = lastCapturedBitmap
-                if (bitmap == null) {
-                    Log.w(TAG, "No bitmap disponible para test")
-                    showMessage("No hay imagen disponible")
-                    isCapturing = false
-                    return@launch
-                }
-                
-                // Paso 1: Detectar lanes
-                val laneDetection = laneDetector.detectLanes(bitmap)
-                if (laneDetection.requiresCalibration || laneDetection.lanes == null) {
-                    Log.e(TAG, "Lane detection falló en test")
-                    showMessage("Error: No se detectaron vías")
-                    isCapturing = false
-                    return@launch
-                }
-                
-                val lanes = laneDetection.lanes
-                
-                // Paso 2: Seleccionar lane según transfer
-                val targetLaneIndex = when (selectedTransfer) {
-                    100 -> 0
-                    200 -> 1
-                    300 -> 2
-                    else -> 0
-                }
-                
-                if (targetLaneIndex >= lanes.size) {
-                    Log.e(TAG, "Lane no disponible para test")
-                    showMessage("Error: Vía no detectada")
-                    isCapturing = false
-                    return@launch
-                }
-                
-                val targetLane = lanes[targetLaneIndex]
-                
-                // Paso 3: Recortar lane completa
-                val laneBitmap = ImageUtils.cropBitmap(
-                    bitmap, 
-                    targetLane.left, 
-                    targetLane.top, 
-                    targetLane.right, 
-                    targetLane.bottom
-                )
-                
-                if (laneBitmap == null) {
-                    Log.e(TAG, "Fallo al recortar lane en test")
-                    showMessage("Error al recortar región")
-                    isCapturing = false
-                    return@launch
-                }
-                
-                // Paso 4: Aplicar recorte automático (center crop temporal)
-                val recorteAutomatico = ImageUtils.cropCenteredByRatio(
-                    laneBitmap,
-                    MonitoringMode.focusedSubRoiWidthRatio,
-                    MonitoringMode.focusedSubRoiHeightRatio
-                ) ?: laneBitmap
-                
-                Log.d(
-                    TAG,
-                    "Test recorte automático: lane=${laneBitmap.width}x${laneBitmap.height} recorte=${recorteAutomatico.width}x${recorteAutomatico.height}"
-                )
-                
-                // Paso 5: Mostrar en preview (SOLO preview, sin guardar estado de entrenamiento)
-                // IMPORTANTE: Limpiar cualquier estado pendiente de guardado para evitar confusión
-                clearPendingCaptureData()
-                
-                // Ahora asignamos solo para preview visual
-                capturedTemplatePreview = recorteAutomatico
-                detectedLaneRegion = targetLane
-                // NO asignamos: pendingTemplateBitmap, lastCapturedTransfer, lastCapturedState
-                // para que el botón "Guardar muestra" permanezca deshabilitado
-                
-                showMessage("Test completado: recorte ${recorteAutomatico.width}x${recorteAutomatico.height}")
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Error en test recorte automático", e)
-                showMessage("Error en test: ${e.message}")
-            } finally {
-                isCapturing = false
-            }
-        }
-    }
     
-    private fun imageToBitmap(image: Image): Bitmap? {
-        return try {
-            // Convert YUV_420_888 image to Bitmap
-            val width = image.width
-            val height = image.height
-            
-            val yBuffer = image.planes[0].buffer // Y
-            val uBuffer = image.planes[1].buffer // U
-            val vBuffer = image.planes[2].buffer // V
-            
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
-            
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            
-            yBuffer.get(nv21, 0, ySize)
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
-            
-            // Convert NV21 to RGB bitmap
-            val rgba = IntArray(width * height)
-            nv21ToRgba(nv21, width, height, rgba)
-            
-            Bitmap.createBitmap(rgba, width, height, Bitmap.Config.ARGB_8888)
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error converting image to bitmap", e)
-            null
-        }
-    }
-    
-    private fun nv21ToRgba(nv21: ByteArray, width: Int, height: Int, rgba: IntArray) {
-        val frameSize = width * height
-        
-        for (j in 0 until height) {
-            for (i in 0 until width) {
-                val y = (nv21[j * width + i].toInt() and 0xff)
-                val v = (nv21[frameSize + (j / 2) * width + (i / 2) * 2].toInt() and 0xff)
-                val u = (nv21[frameSize + (j / 2) * width + (i / 2) * 2 + 1].toInt() and 0xff)
-                
-                val yValue = if (y < 16) 16 else y
-                val uValue = u - 128
-                val vValue = v - 128
-                
-                val r = (1.164 * (yValue - 16) + 1.596 * vValue).toInt().coerceIn(0, 255)
-                val g = (1.164 * (yValue - 16) - 0.813 * vValue - 0.391 * uValue).toInt().coerceIn(0, 255)
-                val b = (1.164 * (yValue - 16) + 2.018 * uValue).toInt().coerceIn(0, 255)
-                
-                rgba[j * width + i] = (255 shl 24) or (r shl 16) or (g shl 8) or b
-            }
-        }
+    private fun recalibrateTrainingSession() {
+        Log.d(TAG, "Recalibrando sesión de entrenamiento")
+        laneDetector.clearCache()
+        transferMonitor.recalibrateLanes()
+        limpiarEstadoCaptura()
+        showMessage("Vías recalibradas")
     }
     
     private fun showMessage(message: String) {
         lifecycleScope.launch {
-            android.widget.Toast.makeText(this@TrainingActivity, message, android.widget.Toast.LENGTH_SHORT).show()
+            android.widget.Toast.makeText(this@TrainingActivity, message, android.widget.Toast.LENGTH_LONG).show()
         }
     }
     

@@ -232,12 +232,12 @@ class TransferMonitor(
             return false
         }
 
+        // Legacy: convertir LaneRegion a SpatialMetadata básico (sin ROI dual)
         val spatialMetadata = laneRegion?.let {
             TemplateStorage.SpatialMetadata(
-                left = it.left,
-                top = it.top,
-                right = it.right,
-                bottom = it.bottom,
+                laneRoi = TemplateStorage.RoiRect(it.left, it.top, it.right, it.bottom),
+                searchRoi = null,
+                masterRoi = null,
                 frameWidth = frameWidth,
                 frameHeight = frameHeight
             )
@@ -247,6 +247,36 @@ class TransferMonitor(
         Log.d(
             TAG,
             "Labeled sample save result transfer=$transferId state=$state success=$success roi=${laneRegion ?: "legacy/no-roi"} frame=${frameWidth}x${frameHeight}"
+        )
+        return success
+    }
+
+    /**
+     * Guarda muestra con metadatos ROI dual completos (nuevo flujo)
+     */
+    fun addLabeledSampleWithMetadata(
+        transferId: Int,
+        state: TransferState,
+        bitmap: Bitmap,
+        spatialMetadata: TemplateStorage.SpatialMetadata
+    ): Boolean {
+        if (state == TransferState.UNKNOWN) {
+            Log.w(TAG, "Rejected labeled sample for UNKNOWN state")
+            return false
+        }
+        if (!MonitoringMode.isTransferEnabled(transferId)) {
+            Log.w(TAG, "Rejected labeled sample for disabled transfer T$transferId")
+            return false
+        }
+        if (!MonitoringMode.isStateEnabled(state)) {
+            Log.w(TAG, "Rejected labeled sample for disabled state $state")
+            return false
+        }
+
+        val success = templateStorage.saveTemplate(transferId, state, bitmap, spatialMetadata)
+        Log.d(
+            TAG,
+            "Labeled sample with dual ROI saved: transfer=$transferId state=$state success=$success dualRoi=${spatialMetadata.hasDualRoi} lane=${spatialMetadata.laneRoi.width}x${spatialMetadata.laneRoi.height}"
         )
         return success
     }
