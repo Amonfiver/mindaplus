@@ -1,3 +1,33 @@
+/**
+ * MainActivity.kt - Pantalla principal de VIGIA con detección por color
+ *
+ * Propósito: Interfaz de usuario para monitorización de transfers
+ *            mediante detección de color naranja en HSV.
+ *
+ * Alcance:
+ *   - Preview de cámara en tiempo real
+ *   - Configuración de Telegram
+ *   - Visualización de estado actual (OK/OBSTACULO)
+ *   - Panel de debug con evidencia de detección
+ *   - Controles de inicio/parada de vigilancia
+ *   - Envío de alertas Telegram por transiciones confirmadas
+ *
+ * Modo temporal activo: T100 + OK/OBSTACULO
+ *   - FALLO desactivado
+ *   - T200/T300 desactivados
+ *
+ * Estrategia de vigilancia:
+ *   - Detección por color HSV como sistema principal
+ *   - Alerta Telegram solo en transición OK -> OBSTACULO confirmada
+ *   - Cooldown centralizado en TransferMonitor (no duplicado)
+ *   - Silencio absoluto en estado OK
+ *
+ * Cambios recientes (SDD - Color HSV):
+ *   - Migración a detección por color como estrategia principal
+ *   - Eliminado sistema de entrenamiento de templates
+ *   - Simplificación de UI: solo vigilancia y configuración
+ *   - Lógica de alerta centralizada en TransferMonitor
+ */
 package com.mindaplus.android
 
 import android.Manifest
@@ -10,7 +40,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -18,9 +47,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -37,49 +63,41 @@ class MainActivity : ComponentActivity() {
     private lateinit var telegramNotifier: TelegramNotifier
     private lateinit var transferMonitor: TransferMonitor
     
+    // Configuración Telegram
     private var telegramToken by mutableStateOf("")
     private var chatId by mutableStateOf("")
-    private var isMonitoring by mutableStateOf(false)
-    private var transferStates by mutableStateOf(mapOf(
-        100 to TransferState.UNKNOWN,
-        200 to TransferState.UNKNOWN,
-        300 to TransferState.UNKNOWN
-    ))
-    private var previewView by mutableStateOf<PreviewView?>(null)
-    private var isTrained by mutableStateOf(false)
-    private var trainingProgress by mutableStateOf(0 to (MonitoringMode.enabledTransfers.size * MonitoringMode.enabledTrainingStates.size).coerceAtLeast(1))
-    private var totalTrainingSamples by mutableStateOf(0)
-    private var debugSnapshot by mutableStateOf<TemplateClassifier.DebugSnapshot?>(null)
     
-    // 5-second throttle mechanism
+    // Estado de vigilancia
+    private var isMonitoring by mutableStateOf(false)
+    private var transferStates by mutableStateOf(mapOf(100 to TransferState.UNKNOWN))
+    
+    // Preview
+    private var previewView by mutableStateOf<PreviewView?>(null)
+    
+    // Debug
+    private var colorResult by mutableStateOf<ColorDetectionResult?>(null)
+    private var laneBitmap by mutableStateOf<Bitmap?>(null)
+    
+    // Throttle de análisis
     private var lastAnalysisTime = 0L
-    private val analysisInterval = 5000L // 5 seconds as specified in v0.1
+    private val analysisInterval = 2000L // 2 segundos entre análisis
     private var isAnalysisInProgress = false
-
-    // Alerting policy
-    private val issueStates = MonitoringMode.issueStatesForAlerts
-    private val reAlertCooldownMs = 60_000L
-    private val lastAlertTimestampByTransfer = mutableMapOf<Int, Long>()
-    private val lastAlertStateByTransfer = mutableMapOf<Int, TransferState>()
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted: Boolean ->
         if (isGranted) {
-            Log.d("Mindaplus", "Camera permission granted")
             initializeCamera()
         } else {
-            Log.e("Mindaplus", "Camera permission denied")
+            Log.e("VIGIA", "Camera permission denied")
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Force landscape orientation
         requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         
-        // Initialize managers
         telegramNotifier = TelegramNotifier()
         cameraManager = CameraManager(this)
         transferMonitor = TransferMonitor(this)
@@ -96,23 +114,12 @@ class MainActivity : ComponentActivity() {
         }
         
         checkCameraPermission()
-        
-        // Update training status
-        updateTrainingStatus()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        updateTrainingStatus()
     }
 
     private fun checkCameraPermission() {
         when {
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) == PackageManager.PERMISSION_GRANTED -> {
-                Log.d("Mindaplus", "Camera permission already granted")
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) 
+                == PackageManager.PERMISSION_GRANTED -> {
                 initializeCamera()
             }
             else -> {
@@ -133,64 +140,71 @@ class MainActivity : ComponentActivity() {
             previewView = previewView,
             onFrameAnalyzed = { bitmap ->
                 if (isMonitoring) {
-                    analyzeCameraFrame(bitmap)
+                    analyzeFrame(bitmap)
                 }
             }
         )
     }
 
-    private fun analyzeCameraFrame(bitmap: Bitmap) {
+    /**
+     * Analiza frame con throttle y envía alertas de transiciones confirmadas.
+     * La lógica de cooldown y detección de transición está centralizada en TransferMonitor.
+     */
+    private fun analyzeFrame(bitmap: Bitmap) {
         val currentTime = System.currentTimeMillis()
-        val timeSinceLastAnalysis = currentTime - lastAnalysisTime
+        val timeSinceLast = currentTime - lastAnalysisTime
         
-        // Implement 5-second throttle
-        if (timeSinceLastAnalysis < analysisInterval) {
-            Log.d("Mindaplus", "MainActivity: Frame skipped due to throttle (${timeSinceLastAnalysis}ms < ${analysisInterval}ms)")
-            return
-        }
-
-        if (isAnalysisInProgress) {
-            Log.d("Mindaplus", "MainActivity: Frame skipped because previous analysis is still running")
+        if (timeSinceLast < analysisInterval || isAnalysisInProgress) {
             return
         }
         
         lastAnalysisTime = currentTime
         isAnalysisInProgress = true
-        Log.d("Mindaplus", "MainActivity: Analysis tick at ts=$currentTime (delta=${timeSinceLastAnalysis}ms)")
         
         lifecycleScope.launch {
             try {
-                val imageWidth = bitmap.width
-                val imageHeight = bitmap.height
-
-                Log.d("Mindaplus", "MainActivity: Analyzing frame ${imageWidth}x${imageHeight}")
-
-                // Analyze frame directly as Bitmap (safe after ImageProxy close)
-                val newStates = transferMonitor.analyzeFrame(bitmap)
+                // Análisis: retorna estados Y alertas de transición ya filtradas
+                val result = transferMonitor.analyzeFrame(bitmap)
+                transferStates = result.states
                 
-                Log.d("Mindaplus", "MainActivity: Analysis results: $newStates")
+                // Guardar debug
+                colorResult = transferMonitor.getLatestColorResult()
+                laneBitmap = transferMonitor.getLatestLaneBitmap()
                 
-                // Check for state changes and send notifications
-                newStates.forEach { (transferId, newState) ->
-                    if (!MonitoringMode.isTransferEnabled(transferId)) {
-                        return@forEach
-                    }
-                    val oldState = transferStates[transferId]
-                    if (oldState != null) {
-                        evaluateAndNotify(transferId, oldState, newState, currentTime)
-                    }
-                }
-                
-                // Update UI state
-                transferStates = newStates
-                if (MonitoringMode.debugPanelEnabled) {
-                    debugSnapshot = transferMonitor.getLatestDebugSnapshot(100)
+                // Procesar alertas ya validadas (solo transiciones OK->OBSTACULO con cooldown respetado)
+                result.alerts.forEach { alert ->
+                    sendTelegramAlert(alert)
                 }
                 
             } catch (e: Exception) {
-                Log.e("Mindaplus", "MainActivity: Error analyzing camera frame", e)
+                Log.e("VIGIA", "Error analyzing frame", e)
             } finally {
                 isAnalysisInProgress = false
+            }
+        }
+    }
+    
+    /**
+     * Envía alerta por Telegram con evidencia.
+     * Solo se llama para transiciones OK -> OBSTACULO ya validadas.
+     */
+    private fun sendTelegramAlert(alert: AlertEvent) {
+        val message = "⚠️ ALERTA: Transfer T${alert.transferId} detectó OBSTÁCULO (color naranja)\n" +
+                      "Transición: ${alert.fromState.displayName} → ${alert.toState.displayName}"
+        
+        lifecycleScope.launch {
+            try {
+                telegramNotifier.updateConfig(telegramToken, chatId)
+                val success = telegramNotifier.sendMessage(message)
+                
+                if (success) {
+                    Log.d("VIGIA", "Alert sent for T${alert.transferId}: ${alert.fromState} -> ${alert.toState}")
+                    
+                    // TODO: Enviar imagen de evidencia si está disponible
+                    // alert.evidence?.let { telegramNotifier.sendPhoto(it, chatId) }
+                }
+            } catch (e: Exception) {
+                Log.e("VIGIA", "Error sending alert", e)
             }
         }
     }
@@ -203,10 +217,10 @@ class MainActivity : ComponentActivity() {
                 .padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Left panel - Camera Preview
+            // Panel izquierdo: Preview de cámara
             Card(
                 modifier = Modifier
-                    .weight(1f)
+                    .weight(1.2f)
                     .fillMaxHeight(),
                 elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
             ) {
@@ -219,224 +233,53 @@ class MainActivity : ComponentActivity() {
                             factory = { preview },
                             modifier = Modifier.fillMaxSize()
                         )
-                    } ?: run {
-                        Text("Camera Preview")
-                    }
+                    } ?: Text("Cámara no disponible")
                 }
             }
             
-            // Right panel - Controls and Status
+            // Panel derecho: Controles y estado
             Column(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                // Header
                 Text(
-                    text = "V0.2 TRAINING UI",
-                    style = MaterialTheme.typography.headlineMedium,
+                    text = "VIGIA - Detección por Color",
+                    style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
-                    color = Color.Magenta
+                    color = MaterialTheme.colorScheme.primary
                 )
-                if (MonitoringMode.singleLaneTestMode) {
-                    Text(
-                        text = "Modo temporal activo: monitorización T100 (OK/OBSTÁCULO)",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.Gray
-                    )
-                }
-                // Telegram Configuration
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(
-                            text = "Telegram Configuration",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold
-                        )
-                        
-                        OutlinedTextField(
-                            value = telegramToken,
-                            onValueChange = { telegramToken = it },
-                            label = { Text("Bot Token") },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = !isMonitoring
-                        )
-                        
-                        OutlinedTextField(
-                            value = chatId,
-                            onValueChange = { chatId = it },
-                            label = { Text("Chat ID") },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = !isMonitoring
-                        )
-                        
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(
-                                onClick = { startMonitoring() },
-                                enabled = !isMonitoring && telegramToken.isNotBlank() && chatId.isNotBlank(),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("Start Monitoring")
-                            }
-                            
-                            Button(
-                                onClick = { stopMonitoring() },
-                                enabled = isMonitoring,
-                                modifier = Modifier.weight(1f),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
-                            ) {
-                                Text("Stop Monitoring")
-                            }
-                        }
-                    }
-                }
                 
-                // Transfer Status
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(
-                            text = "Transfer Status",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold
-                        )
-                        
-                        for (transferId in MonitoringMode.enabledTransfers) {
-                            TransferStatusRow(transferId, transferStates[transferId] ?: TransferState.UNKNOWN)
-                        }
-                    }
-                }
+                Text(
+                    text = "Modo: T100 | Estados: OK / OBSTÁCULO",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray
+                )
                 
-                // Training Status and Controls
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(
-                            text = "Training Status",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold
-                        )
-                        
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Entrenado:",
-                                style = MaterialTheme.typography.bodyLarge
-                            )
-                            
-                            Text(
-                                text = if (isTrained) "Sí" else "No",
-                                color = if (isTrained) Color.Green else Color.Red,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                        
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Progreso:",
-                                style = MaterialTheme.typography.bodyLarge
-                            )
-                            
-                            Text(
-                                text = "${trainingProgress.first}/${trainingProgress.second}",
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Muestras:",
-                                style = MaterialTheme.typography.bodyLarge
-                            )
-
-                            Text(
-                                text = "$totalTrainingSamples",
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                        
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(
-                                onClick = { openTrainingScreen() },
-                                modifier = Modifier.weight(1f),
-                                enabled = !isMonitoring
-                            ) {
-                                Text("Entrenamiento")
-                            }
-                            
-                            Button(
-                                onClick = { recalibrateLanes() },
-                                modifier = Modifier.weight(1f),
-                                enabled = !isMonitoring
-                            ) {
-                                Text("Recalibrar vías")
-                            }
-                        }
-                    }
-                }
-
+                // Configuración Telegram
+                TelegramConfigCard()
+                
+                // Estado actual
+                StatusCard()
+                
+                // Controles
+                ControlCard()
+                
+                // Debug panel
                 if (MonitoringMode.debugPanelEnabled) {
-                    DebugPanel()
+                    DebugCard()
                 }
                 
                 Spacer(modifier = Modifier.weight(1f))
-                
-                // Monitoring Status
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-                ) {
-                    Box(
-                        modifier = Modifier.padding(16.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = if (isMonitoring) "Monitoring Active" else "Monitoring Inactive",
-                            color = if (isMonitoring) Color.Green else Color.Red,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
             }
         }
     }
-
+    
     @Composable
-    private fun DebugPanel() {
+    private fun TelegramConfigCard() {
         Card(
             modifier = Modifier.fillMaxWidth(),
             elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
@@ -446,270 +289,220 @@ class MainActivity : ComponentActivity() {
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "Debug ROI Dual",
-                    style = MaterialTheme.typography.headlineSmall,
+                    "Configuración Telegram",
+                    style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
-                val snapshot = debugSnapshot
-                if (snapshot == null) {
-                    Text("Sin snapshot de depuración todavía.")
-                } else {
-                    Text("Transfer: T${snapshot.transferId}")
-                    Text("Estrategia: ${snapshot.strategy}")
-                    Text("Veredicto: ${snapshot.finalState.displayName} (${snapshot.finalReason}) score=${"%.4f".format(snapshot.finalScore)}")
-
-                    snapshot.stateDebug[TransferState.OK]?.let { ok ->
-                        Text("OK -> ${ok.searchStrategy} visual=${"%.4f".format(ok.bestVisual)} final=${"%.4f".format(ok.laneAdjusted)}")
+                
+                OutlinedTextField(
+                    value = telegramToken,
+                    onValueChange = { telegramToken = it },
+                    label = { Text("Bot Token") },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isMonitoring,
+                    singleLine = true
+                )
+                
+                OutlinedTextField(
+                    value = chatId,
+                    onValueChange = { chatId = it },
+                    label = { Text("Chat ID") },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isMonitoring,
+                    singleLine = true
+                )
+            }
+        }
+    }
+    
+    @Composable
+    private fun StatusCard() {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    "Estado de Vigilancia",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                // T100
+                val state = transferStates[100] ?: TransferState.UNKNOWN
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Transfer 100", style = MaterialTheme.typography.bodyLarge)
+                    
+                    val (bgColor, textColor) = when (state) {
+                        TransferState.OK -> Color(0xFF4CAF50) to Color.White
+                        TransferState.OBSTACULO -> Color(0xFFFF5722) to Color.White
+                        else -> Color.Gray to Color.White
                     }
-                    snapshot.stateDebug[TransferState.OBSTACULO]?.let { obst ->
-                        Text("OBST -> ${obst.searchStrategy} visual=${"%.4f".format(obst.bestVisual)} final=${"%.4f".format(obst.laneAdjusted)}")
-                    }
-
-                    // Row 1: Lane actual con Search ROI (azul) y Located ROI (verde)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    
+                    Surface(
+                        color = bgColor,
+                        shape = MaterialTheme.shapes.small
                     ) {
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Lane + Search ROI (azul)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                            Box(modifier = Modifier.fillMaxWidth().height(90.dp)) {
-                                Image(
-                                    bitmap = snapshot.laneBitmap.asImageBitmap(),
-                                    contentDescription = "Lane",
-                                    modifier = Modifier.fillMaxSize(),
-                                    contentScale = ContentScale.Fit
-                                )
-                                // Dibujar Search ROI (ROI 1) en azul
-                                snapshot.searchRect?.let { searchRoi ->
-                                    Canvas(modifier = Modifier.fillMaxSize()) {
-                                        val mapping = ImageUtils.computeFitDisplayMapping(
-                                            viewWidth = size.width.toInt(),
-                                            viewHeight = size.height.toInt(),
-                                            bitmapWidth = snapshot.laneBitmap.width,
-                                            bitmapHeight = snapshot.laneBitmap.height
-                                        )
-                                        val left = mapping.offsetX + (searchRoi.left.toFloat() * mapping.scale)
-                                        val top = mapping.offsetY + (searchRoi.top.toFloat() * mapping.scale)
-                                        val right = mapping.offsetX + (searchRoi.right.toFloat() * mapping.scale)
-                                        val bottom = mapping.offsetY + (searchRoi.bottom.toFloat() * mapping.scale)
-                                        drawRect(
-                                            color = Color.Blue,
-                                            topLeft = Offset(left, top),
-                                            size = Size(right - left, bottom - top),
-                                            style = Stroke(width = 3f)
-                                        )
-                                    }
-                                }
-                                // Dibujar Located Rect (ventana encontrada) en verde
-                                snapshot.locatedRect?.let { located ->
-                                    Canvas(modifier = Modifier.fillMaxSize()) {
-                                        val mapping = ImageUtils.computeFitDisplayMapping(
-                                            viewWidth = size.width.toInt(),
-                                            viewHeight = size.height.toInt(),
-                                            bitmapWidth = snapshot.laneBitmap.width,
-                                            bitmapHeight = snapshot.laneBitmap.height
-                                        )
-                                        val left = mapping.offsetX + (located.left.toFloat() * mapping.scale)
-                                        val top = mapping.offsetY + (located.top.toFloat() * mapping.scale)
-                                        val right = mapping.offsetX + (located.right.toFloat() * mapping.scale)
-                                        val bottom = mapping.offsetY + (located.bottom.toFloat() * mapping.scale)
-                                        drawRect(
-                                            color = Color.Green,
-                                            topLeft = Offset(left, top),
-                                            size = Size(right - left, bottom - top),
-                                            style = Stroke(width = 2f)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Ventana actual (localizada)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                            Image(
-                                bitmap = snapshot.currentWindowBitmap.asImageBitmap(),
-                                contentDescription = "Current Window",
-                                modifier = Modifier.fillMaxWidth().height(90.dp)
-                            )
-                        }
+                        Text(
+                            text = when (state) {
+                                TransferState.OK -> "OK"
+                                TransferState.OBSTACULO -> "OBSTÁCULO"
+                                else -> "?"
+                            },
+                            color = textColor,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
                     }
-
-                    // Row 2: Referencias OK y OBST
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        snapshot.okReference?.let {
-                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text("Referencia OK (maestra)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                                Image(bitmap = it.asImageBitmap(), contentDescription = "OK ref", modifier = Modifier.fillMaxWidth().height(90.dp))
-                            }
-                        }
-                        snapshot.obstaculoReference?.let {
-                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text("Referencia OBST (maestra)", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                                Image(bitmap = it.asImageBitmap(), contentDescription = "OBST ref", modifier = Modifier.fillMaxWidth().height(90.dp))
-                            }
-                        }
-                    }
+                }
+                
+                // Detalles de detección
+                colorResult?.let { result ->
+                    Divider()
+                    
+                    Text(
+                        "Detección de color:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
+                    
+                    Text("• Ratio naranja: ${"%.1f".format(result.orangePixelRatio * 100)}%")
+                    Text("• Confianza: ${"%.0f".format(result.confidence * 100)}%")
+                    Text("• Blob válido: ${if (result.hasValidBlob) "Sí" else "No"}")
                 }
             }
         }
     }
-
+    
     @Composable
-    private fun TransferStatusRow(transferId: Int, state: TransferState) {
-        Row(
+    private fun ControlCard() {
+        Card(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
         ) {
-            Text(
-                text = "Transfer $transferId",
-                style = MaterialTheme.typography.bodyLarge
-            )
-            
-            Text(
-                text = state.displayName,
-                color = when (state) {
-                    TransferState.OK -> Color.Green
-                    TransferState.OBSTACULO -> Color.Red
-                    TransferState.FALLO -> Color(0xFFFFA500) // Orange
-                    TransferState.UNKNOWN -> Color.Gray
-                },
-                fontWeight = FontWeight.Bold
-            )
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Estado de vigilancia
+                Surface(
+                    color = if (isMonitoring) Color(0xFF4CAF50) else Color.Gray,
+                    shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = if (isMonitoring) "VIGILANCIA ACTIVA" else "VIGILANCIA INACTIVA",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                }
+                
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = { startMonitoring() },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isMonitoring && telegramToken.isNotBlank() && chatId.isNotBlank()
+                    ) {
+                        Text("Iniciar")
+                    }
+                    
+                    Button(
+                        onClick = { stopMonitoring() },
+                        modifier = Modifier.weight(1f),
+                        enabled = isMonitoring,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
+                    ) {
+                        Text("Detener")
+                    }
+                }
+                
+                OutlinedButton(
+                    onClick = { transferMonitor.recalibrateLanes() },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isMonitoring
+                ) {
+                    Text("Recalibrar Vías")
+                }
+            }
+        }
+    }
+    
+    @Composable
+    private fun DebugCard() {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    "Debug - Detección",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                // Imagen de la lane
+                laneBitmap?.let { bitmap ->
+                    Text("ROI de análisis:", style = MaterialTheme.typography.bodySmall)
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "Lane ROI",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(120.dp),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+                
+                // Evidencia con máscara
+                colorResult?.evidenceBitmap?.let { evidence ->
+                    Text("Máscara de color (verde = naranja):", style = MaterialTheme.typography.bodySmall)
+                    Image(
+                        bitmap = evidence.asImageBitmap(),
+                        contentDescription = "Evidence",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(120.dp),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            }
         }
     }
 
     private fun startMonitoring() {
-        Log.d("Mindaplus", "MainActivity: Starting monitoring")
         telegramNotifier.updateConfig(telegramToken, chatId)
         isMonitoring = true
-        lastAnalysisTime = 0L // Reset throttle timer
-        Log.d("Mindaplus", "MainActivity: Monitoring started with 5-second throttle")
+        lastAnalysisTime = 0L
+        Log.d("VIGIA", "Monitoring started")
     }
 
     private fun stopMonitoring() {
-        Log.d("Mindaplus", "MainActivity: Stopping monitoring")
         isMonitoring = false
-        Log.d("Mindaplus", "MainActivity: Monitoring stopped")
+        Log.d("VIGIA", "Monitoring stopped")
     }
     
-    private fun openTrainingScreen() {
-        Log.d("Mindaplus", "MainActivity: Opening training screen")
-        val intent = android.content.Intent(this, TrainingActivity::class.java)
-        startActivity(intent)
-    }
-    
-    private fun recalibrateLanes() {
-        Log.d("Mindaplus", "MainActivity: Recalibrating lanes")
-        transferMonitor.recalibrateLanes()
-        Log.d("Mindaplus", "MainActivity: Lane calibration reset")
-    }
-    
-    private fun updateTrainingStatus() {
-        val stats = transferMonitor.getTrainingStats()
-        isTrained = stats.baseCovered == stats.baseTotal
-        trainingProgress = stats.baseCovered to stats.baseTotal
-        totalTrainingSamples = stats.totalSamples
-        Log.d(
-            "Mindaplus",
-            "MainActivity: Training status updated - trained=$isTrained base=${trainingProgress.first}/${trainingProgress.second} samples=$totalTrainingSamples"
-        )
-    }
-
-    private fun evaluateAndNotify(
-        transferId: Int,
-        oldState: TransferState,
-        newState: TransferState,
-        nowTs: Long
-    ) {
-        if (!MonitoringMode.isTransferEnabled(transferId)) {
-            Log.d("Mindaplus", "MainActivity: Notification skipped for disabled transfer T$transferId")
-            return
-        }
-
-        val lastAlertTs = lastAlertTimestampByTransfer[transferId]
-        val lastAlertState = lastAlertStateByTransfer[transferId]
-        Log.d(
-            "Mindaplus",
-            "MainActivity: Notification decision T$transferId old=$oldState new=$newState analysisTs=$nowTs lastAlertTs=$lastAlertTs lastAlertState=$lastAlertState"
-        )
-
-        if (newState in issueStates) {
-            val isNewIssueTransition = oldState != newState || oldState !in issueStates
-            if (isNewIssueTransition) {
-                sendNotification(transferId, oldState, newState, "state_change_issue")
-                lastAlertTimestampByTransfer[transferId] = nowTs
-                lastAlertStateByTransfer[transferId] = newState
-                return
-            }
-
-            val canReAlert = lastAlertTs == null || (nowTs - lastAlertTs) >= reAlertCooldownMs
-            if (canReAlert) {
-                sendNotification(transferId, oldState, newState, "persistent_realert")
-                lastAlertTimestampByTransfer[transferId] = nowTs
-                lastAlertStateByTransfer[transferId] = newState
-            } else {
-                val elapsedSinceAlert = nowTs - (lastAlertTs ?: nowTs)
-                Log.d(
-                    "Mindaplus",
-                    "MainActivity: Skipping Telegram for T$transferId (cooldown active ${elapsedSinceAlert}ms < ${reAlertCooldownMs}ms)"
-                )
-            }
-            return
-        }
-
-        if (oldState in issueStates && newState == TransferState.OK) {
-            sendNotification(transferId, oldState, newState, "recovery")
-            lastAlertTimestampByTransfer.remove(transferId)
-            lastAlertStateByTransfer.remove(transferId)
-            return
-        }
-
-        Log.d("Mindaplus", "MainActivity: No Telegram notification for T$transferId old=$oldState new=$newState")
-    }
-
-    private fun sendNotification(
-        transferId: Int,
-        oldState: TransferState,
-        newState: TransferState,
-        reason: String
-    ) {
-        val message = when {
-            newState == TransferState.OBSTACULO && oldState != TransferState.OBSTACULO ->
-                "Transfer $transferId parado, obstáculo en la vía."
-            newState == TransferState.FALLO && oldState != TransferState.FALLO ->
-                "Transfer $transferId en fallo."
-            newState in issueStates && oldState == newState ->
-                "Recordatorio: Transfer $transferId sigue en ${newState.displayName}."
-            oldState in issueStates && newState == TransferState.OK ->
-                "Transfer $transferId rearmado, todo OK."
-            else -> return
-        }
-
-        Log.d("Mindaplus", "MainActivity: Sending Telegram notification reason=$reason msg=$message")
-
-        lifecycleScope.launch {
-            try {
-                val success = telegramNotifier.sendMessage(message)
-                if (success) {
-                    Log.d("Mindaplus", "MainActivity: Telegram notification sent successfully reason=$reason")
-                } else {
-                    Log.e("Mindaplus", "MainActivity: Failed to send Telegram notification reason=$reason")
-                }
-            } catch (e: Exception) {
-                Log.e("Mindaplus", "MainActivity: Exception sending Telegram notification reason=$reason", e)
-            }
-        }
-    }
-
     override fun onDestroy() {
         super.onDestroy()
         cameraManager.cleanup()
     }
 }
 
+// Enum mantenido para compatibilidad
 enum class TransferState {
     OK,
     OBSTACULO,

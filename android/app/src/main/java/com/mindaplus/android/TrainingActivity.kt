@@ -610,110 +610,12 @@ class TrainingActivity : ComponentActivity() {
     }
     
     /**
-     * Guarda la muestra con metadatos ROI dual
+     * Guarda la muestra - DESACTIVADO en modo color HSV
+     * El sistema ya no requiere entrenamiento de templates
      */
     private fun guardarMuestraDual() {
-        lifecycleScope.launch {
-            try {
-                val laneBitmap = lanePreviewBitmap
-                val laneRegion = detectedLaneRegion
-                val frameWidth = pendingFrameWidth
-                val frameHeight = pendingFrameHeight
-                
-                if (laneBitmap == null || laneRegion == null || frameWidth == null || frameHeight == null) {
-                    showMessage("Error: No hay datos de captura")
-                    return@launch
-                }
-                
-                // Verificar selecciones
-                if (roi1SelectionStart == null || roi1SelectionEnd == null ||
-                    roi2SelectionStart == null || roi2SelectionEnd == null) {
-                    showMessage("Error: Faltan selecciones ROI")
-                    return@launch
-                }
-                
-                // Calcular coordenadas normalizadas
-                val normRoi1 = calcularCoordenadasNormalizadas(
-                    roi1SelectionStart!!, roi1SelectionEnd!!,
-                    selectionCanvasSize, laneBitmap.width, laneBitmap.height
-                )
-                val normRoi2 = calcularCoordenadasNormalizadas(
-                    roi2SelectionStart!!, roi2SelectionEnd!!,
-                    selectionCanvasSize, laneBitmap.width, laneBitmap.height
-                )
-                
-                // Validar tamaños mínimos
-                if (normRoi1.third - normRoi1.first < 0.05f || normRoi1.fourth - normRoi1.second < 0.05f) {
-                    showMessage("Error: ROI 1 (azul) demasiado pequeño")
-                    return@launch
-                }
-                if (normRoi2.third - normRoi2.first < 0.03f || normRoi2.fourth - normRoi2.second < 0.03f) {
-                    showMessage("Error: ROI 2 (rojo) demasiado pequeño")
-                    return@launch
-                }
-                
-                // Validar que ROI 2 esté dentro de ROI 1
-                if (!roiContieneOtra(normRoi1, normRoi2)) {
-                    showMessage("Error: ROI 2 debe estar dentro de ROI 1")
-                    return@launch
-                }
-                
-                // Crear RoiRects (coordenadas relativas a la lane)
-                val searchRoi = TemplateStorage.RoiRect.fromNormalized(
-                    normRoi1.first, normRoi1.second, normRoi1.third, normRoi1.fourth,
-                    laneBitmap.width, laneBitmap.height
-                )
-                val masterRoi = TemplateStorage.RoiRect.fromNormalized(
-                    normRoi2.first, normRoi2.second, normRoi2.third, normRoi2.fourth,
-                    laneBitmap.width, laneBitmap.height
-                )
-                
-                // Lane ROI en coordenadas del frame original
-                val laneRoi = TemplateStorage.RoiRect(
-                    laneRegion.left, laneRegion.top, laneRegion.right, laneRegion.bottom
-                )
-                
-                // Recortar la muestra maestra (ROI 2)
-                val masterBitmap = ImageUtils.cropBitmap(
-                    laneBitmap,
-                    masterRoi.left, masterRoi.top, masterRoi.right, masterRoi.bottom
-                )
-                
-                if (masterBitmap == null) {
-                    showMessage("Error al recortar muestra maestra")
-                    return@launch
-                }
-                
-                // Crear metadatos espaciales
-                val spatialMetadata = TemplateStorage.SpatialMetadata(
-                    laneRoi = laneRoi,
-                    searchRoi = searchRoi,
-                    masterRoi = masterRoi,
-                    frameWidth = frameWidth,
-                    frameHeight = frameHeight
-                )
-                
-                // Guardar
-                val success = transferMonitor.addLabeledSampleWithMetadata(
-                    transferId = selectedTransfer,
-                    state = selectedState,
-                    bitmap = masterBitmap,
-                    spatialMetadata = spatialMetadata
-                )
-                
-                if (success) {
-                    updateTrainingProgress()
-                    showMessage("Muestra guardada: ${masterBitmap.width}x${masterBitmap.height} con ROI dual")
-                    limpiarEstadoCaptura()
-                } else {
-                    showMessage("Error al guardar la muestra")
-                }
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Error guardando muestra dual", e)
-                showMessage("Error: ${e.message}")
-            }
-        }
+        showMessage("Sistema de entrenamiento desactivado. Use detección por color.")
+        limpiarEstadoCaptura()
     }
     
     /**
